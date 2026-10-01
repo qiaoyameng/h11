@@ -163,6 +163,39 @@ attempt to override this to some other value then
 HTTP/1.1. But it does understand other versions of HTTP, so you might
 receive events with other ``http_version`` values from remote peers.
 
+.. _request-target:
+
+Request targets
+~~~~~~~~~~~~~~~
+
+`RFC 7230 section 5.3
+<https://tools.ietf.org/html/rfc7230#section-5.3>`_ allows four
+different request-target forms, depending on the request method:
+
+* *origin-form* -- ``/path?query`` -- used for ordinary requests,
+* *absolute-form* -- ``http://host:port/path?query`` -- mostly used
+  when talking to a proxy,
+* *authority-form* -- ``host:port`` -- only used for ``CONNECT``,
+* *asterisk-form* -- ``*`` -- only used for ``OPTIONS``.
+
+By default h11 only checks that the target consists of visible ASCII
+characters, for backwards compatibility. If you pass
+``strict_request_target=True`` when constructing a
+:class:`Connection` (or a :class:`Request`), then h11 also verifies
+that the target's form matches the method, that percent-escapes,
+IPv6 literals and ports are well-formed, that userinfo (``user@host``)
+and control characters are rejected, and -- for absolute-form
+targets -- that the target's authority agrees with the ``Host``
+header. This is recommended in particular when implementing a proxy,
+where different interpretations of an ambiguous request target can
+enable request-smuggling attacks. The same checks are applied to
+requests sent by a client and requests received by a server, and the
+:attr:`Request.target` bytes are always passed through unchanged:
+
+.. code-block:: python
+
+    server = h11.Connection(h11.SERVER, strict_request_target=True)
+
 Here's the complete set of events supported by h11:
 
 .. autoclass:: Request

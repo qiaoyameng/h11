@@ -37,6 +37,7 @@ from ._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
+from ._uri import get_host_header, validate_request_target
 from ._util import (  # Import the internal things we need
     LocalProtocolError,
     RemoteProtocolError,
@@ -162,14 +163,31 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        strict_request_target (bool):
+            Whether to strictly validate request targets (the
+            :attr:`Request.target` field) according to RFC 7230 section
+            5.3. When enabled, this applies both to requests received
+            from the peer (:meth:`next_event`) and to requests we send
+            (:meth:`send`): origin-form is required for ordinary
+            requests, authority-form (with a port) for ``CONNECT``,
+            asterisk-form (``"*"``) only for ``OPTIONS``, and
+            absolute-form targets must have a well-formed authority
+            consistent with the ``Host`` header. Userinfo, control
+            characters and other illegal syntax are rejected. The
+            target bytes themselves are never modified. Defaults to
+            ``False`` for backwards compatibility; this is especially
+            useful when implementing a proxy.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        strict_request_target: bool = False,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._strict_request_target = strict_request_target
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -480,6 +498,12 @@ class Connection:
         try:
             event = self._extract_next_receive_event()
             if event not in [NEED_DATA, PAUSED]:
+                if self._strict_request_target and type(event) is Request:
+                    validate_request_target(  # type: ignore[attr-defined]
+                        method=event.method,
+                        target=event.target,
+                        host_header=get_host_header(event.headers),
+                    )
                 self._process_event(self.their_role, cast(Event, event))
             if event is NEED_DATA:
                 if len(self._receive_buffer) > self._max_incomplete_event_size:
@@ -552,6 +576,12 @@ class Connection:
         if self.our_state is ERROR:
             raise LocalProtocolError("Can't send data when our state is ERROR")
         try:
+            if self._strict_request_target and type(event) is Request:
+                validate_request_target(
+                    method=event.method,
+                    target=event.target,
+                    host_header=get_host_header(event.headers),
+                )
             if type(event) is Response:
                 event = self._clean_up_response_headers_for_sending(event)
             # We want to call _process_event before calling the writer,

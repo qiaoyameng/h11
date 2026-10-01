@@ -12,6 +12,7 @@ from typing import List, Tuple, Union
 
 from ._abnf import method, request_target
 from ._headers import Headers, normalize_and_validate
+from ._uri import get_host_header, validate_request_target
 from ._util import bytesify, LocalProtocolError, validate
 
 # Everything in __all__ gets re-exported as part of the h11 public API.
@@ -70,6 +71,29 @@ class Request(Event):
        ``b"1.1"``. See :ref:`the HTTP version normalization rules
        <http_version-format>` for details.
 
+    .. attribute:: strict_request_target
+
+       Whether to strictly validate that :attr:`target` is a
+       well-formed request target whose form matches :attr:`method`
+       (see `RFC 7230 section 5.3
+       <https://tools.ietf.org/html/rfc7230#section-5.3>`_). This
+       checks that:
+
+       - ordinary requests use origin-form (``"/path?query"``),
+       - ``CONNECT`` uses authority-form (``"host:port"``, with a port),
+       - only ``OPTIONS`` uses asterisk-form (``"*"``),
+       - absolute-form targets (``"http://host/path"``) have a valid
+         authority (including IPv6 literals, percent-escapes and ports)
+         and agree with the ``Host`` header,
+       - userinfo, control characters and other illegal syntax are
+         rejected.
+
+       Defaults to ``False`` for backwards compatibility. Note that a
+       :class:`Connection` created with ``strict_request_target=True``
+       applies the same checks when sending or receiving a
+       :class:`Request`. The target bytes are never modified, even when
+       they represent, e.g., an absolute URI with an empty path.
+
     """
 
     __slots__ = ("method", "headers", "target", "http_version")
@@ -86,6 +110,7 @@ class Request(Event):
         headers: Union[Headers, List[Tuple[bytes, bytes]], List[Tuple[str, str]]],
         target: Union[bytes, str],
         http_version: Union[bytes, str] = b"1.1",
+        strict_request_target: bool = False,
         _parsed: bool = False,
     ) -> None:
         super().__init__()
@@ -120,6 +145,13 @@ class Request(Event):
 
         validate(method_re, self.method, "Illegal method characters")
         validate(request_target_re, self.target, "Illegal target characters")
+
+        if strict_request_target:
+            validate_request_target(
+                method=self.method,
+                target=self.target,
+                host_header=get_host_header(self.headers),
+            )
 
     # This is an unhashable type.
     __hash__ = None  # type: ignore

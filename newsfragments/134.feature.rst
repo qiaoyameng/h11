@@ -1,0 +1,11 @@
+Add optional strict validation of request targets. Both
+``Connection`` and ``Request`` now accept a
+``strict_request_target`` argument; when enabled, h11 verifies that
+the request target is a well-formed origin-form, absolute-form,
+authority-form (for ``CONNECT``), or asterisk-form (for ``OPTIONS``)
+target consistent with the method, including correct percent-escaping,
+IPv6 literals, ports, and rejection of userinfo and control
+characters. Absolute-form targets are also checked for consistency
+with the ``Host`` header. The check is shared between outgoing
+(client) and incoming (server) requests, and never modifies the
+target bytes. It defaults to off for backwards compatibility.
