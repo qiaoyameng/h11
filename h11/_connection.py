@@ -1,10 +1,13 @@
 # This contains the main Connection class. Everything in h11 revolves around
 # this.
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
     cast,
     Dict,
+    Iterable,
     List,
     Optional,
     overload,
@@ -42,10 +45,23 @@ from ._util import (  # Import the internal things we need
     RemoteProtocolError,
     Sentinel,
 )
-from ._writers import WRITERS, WritersType
+from ._writers import (
+    ChunkedWriter,
+    ContentLengthWriter,
+    Http10Writer,
+    WRITERS,
+    WritersType,
+)
 
 # Everything in __all__ gets re-exported as part of the h11 public API.
-__all__ = ["Connection", "NEED_DATA", "PAUSED"]
+__all__ = [
+    "Connection",
+    "NEED_DATA",
+    "PAUSED",
+    "Framing",
+    "SendPreflightEventResult",
+    "SendPreflightResult",
+]
 
 
 class NEED_DATA(Sentinel, metaclass=Sentinel):
@@ -54,6 +70,108 @@ class NEED_DATA(Sentinel, metaclass=Sentinel):
 
 class PAUSED(Sentinel, metaclass=Sentinel):
     pass
+
+
+@dataclass(frozen=True)
+class Framing:
+    """The framing that h11 predicts it will use for a message body.
+
+    Attributes:
+        kind: One of the strings ``"content-length"``, ``"chunked"``, or
+            ``"http/1.0"`` -- these are the same framing modes used
+            internally by :func:`~h11._connection._body_framing`.
+        length: For ``"content-length"`` framing, the declared body length
+            in bytes. :data:`None` for the other framing modes, where the
+            body length is not known until the body is finished (or
+            forever, in the ``"http/1.0"`` close-delimited case).
+    """
+
+    kind: str
+    length: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SendPreflightEventResult:
+    """The result of checking one event during a
+    :meth:`Connection.preflight_send`.
+
+    Attributes:
+        index: This event's position in the sequence passed to
+            :meth:`~Connection.preflight_send`.
+        event: The event that was checked.
+        legal: ``True`` if sending this event at this point is legal;
+            ``False`` if it would raise :exc:`LocalProtocolError`.
+        framing: If this event opens a message with a body (i.e. it's a
+            :class:`Request` or :class:`Response` that moves things into
+            :data:`SEND_BODY`), this gives the framing predicted for that
+            body. Otherwise :data:`None`.
+        states_before: The connection's per-role states immediately
+            *before* this event.
+        states_after: The connection's per-role states immediately *after*
+            this event (or in :data:`ERROR` if it failed).
+        waiting_for_100_continue_after: The predicted value of
+            :attr:`Connection.client_is_waiting_for_100_continue` after
+            this event.
+    """
+
+    index: int
+    event: Event
+    legal: bool
+    framing: Optional[Framing] = None
+    states_before: Dict[Type[Sentinel], Type[Sentinel]] = field(default_factory=dict)
+    states_after: Dict[Type[Sentinel], Type[Sentinel]] = field(default_factory=dict)
+    waiting_for_100_continue_after: bool = False
+
+
+@dataclass(frozen=True)
+class SendPreflightResult:
+    """The result of a :meth:`Connection.preflight_send` check.
+
+    This does not describe any bytes that would be sent -- the preflight
+    never generates a body or otherwise touches the payload data.
+
+    Attributes:
+        events: The events that were checked, as a fresh tuple. If a
+            one-shot iterator was passed to
+            :meth:`~Connection.preflight_send`, then that iterator is
+            consumed -- use this tuple to perform the actual sends, e.g.
+            ``for event in result.events: conn.send(event)``.
+        event_results: One :class:`SendPreflightEventResult` per checked
+            event, up to and including the first event that failed (if
+            any). Events after a failure are not checked, because the
+            connection would be in :data:`ERROR` by then.
+        failed_at: The index of the first event that would fail, or
+            :data:`None` if no event failed.
+        error: The :exc:`LocalProtocolError` that the failing event would
+            raise, or :data:`None` if no event failed.
+        legal: ``True`` if the whole sequence is legal and complete;
+            ``False`` if some event is illegal; :data:`None` if every
+            event seen so far is legal, but the sequence ends in the
+            middle of a body, where the final verdict depends on payload
+            that hasn't been seen yet.
+        framing: The framing of the last message opened by the sequence,
+            if any.
+        states: The predicted per-role states after the whole sequence.
+        client_is_waiting_for_100_continue: The predicted value of
+            :attr:`Connection.client_is_waiting_for_100_continue` after
+            the whole sequence.
+    """
+
+    events: Tuple[Event, ...]
+    event_results: Tuple[SendPreflightEventResult, ...]
+    failed_at: Optional[int]
+    error: Optional[LocalProtocolError]
+    legal: Optional[bool]
+    framing: Optional[Framing]
+    states: Dict[Type[Sentinel], Type[Sentinel]]
+    client_is_waiting_for_100_continue: bool
+
+    @property
+    def undetermined(self) -> bool:
+        """True if :attr:`legal` is :data:`None` -- all events seen so
+        far are legal, but the sequence is incomplete and its final
+        legality depends on not-yet-seen body data."""
+        return self.legal is None
 
 
 # If we ever have this much buffered without it making a complete parseable
@@ -551,28 +669,40 @@ class Connection:
         """
         if self.our_state is ERROR:
             raise LocalProtocolError("Can't send data when our state is ERROR")
+        data_list: List[bytes] = []
         try:
-            if type(event) is Response:
-                event = self._clean_up_response_headers_for_sending(event)
-            # We want to call _process_event before calling the writer,
-            # because if someone tries to do something invalid then this will
-            # give a sensible error message, while our writers all just assume
-            # they will only receive valid events. But, _process_event might
-            # change self._writer. So we have to do a little dance:
-            writer = self._writer
-            self._process_event(self.our_role, event)
-            if type(event) is ConnectionClosed:
-                return None
-            else:
-                # In any situation where writer is None, process_event should
-                # have raised ProtocolError
-                assert writer is not None
-                data_list: List[bytes] = []
-                writer(event, data_list.append)
-                return data_list
+            self._write_event(event, data_list.append)
         except:
             self._process_error(self.our_role)
             raise
+        if type(event) is ConnectionClosed:
+            return None
+        return data_list
+
+    def _write_event(
+        self, event: Event, write: Callable[[Any], None]
+    ) -> Event:
+        # Shared core of send_with_data_passthrough and preflight_send: runs
+        # the state machine and the writer for one event, handing every
+        # emitted chunk to 'write'. For a Response, returns the
+        # header-cleaned version that was actually checked; otherwise the
+        # event passed in. Does not check for ERROR state or call
+        # _process_error -- the caller is responsible for those.
+        if type(event) is Response:
+            event = self._clean_up_response_headers_for_sending(event)
+        # We want to call _process_event before calling the writer,
+        # because if someone tries to do something invalid then this will
+        # give a sensible error message, while our writers all just assume
+        # they will only receive valid events. But, _process_event might
+        # change self._writer. So we have to do a little dance:
+        writer = self._writer
+        self._process_event(self.our_role, event)
+        if type(event) is not ConnectionClosed:
+            # In any situation where writer is None, process_event should
+            # have raised ProtocolError
+            assert writer is not None
+            writer(event, write)
+        return event
 
     def send_failed(self) -> None:
         """Notify the state machine that we failed to send the data it gave
@@ -583,6 +713,165 @@ class Connection:
 
         """
         self._process_error(self.our_role)
+
+    @overload
+    def preflight_send(self, event: Iterable[Event]) -> SendPreflightResult:
+        ...
+
+    @overload
+    def preflight_send(self, event: Event) -> SendPreflightResult:
+        ...
+
+    def preflight_send(
+        self, event: Union[Event, Iterable[Event]]
+    ) -> SendPreflightResult:
+        """Check whether one or more events could be sent, without
+        actually sending them.
+
+        This simulates running :meth:`send` on a throwaway copy of the
+        connection, so:
+
+        * the real connection's state is left completely untouched -- the
+          actual sends performed afterwards will get exactly the same
+          legality verdict;
+        * no bytes are generated or buffered (the writers' output is
+          discarded), and the payload objects in :class:`Data` events are
+          only inspected via :func:`len`, so one-shot payloads like
+          :ref:`sendfile` placeholders are not consumed.
+
+        Args:
+            event: A single :ref:`event <events>` or an iterable of
+                events. If a one-shot iterator is passed, it will be
+                consumed here -- but the checked events are returned on
+                the result's ``events`` attribute, so you can iterate
+                that tuple to perform the actual sends.
+
+        Returns:
+            A :class:`SendPreflightResult` describing the predicted
+            framing, the position of the first failing event (if any),
+            and the predicted states. For parts whose legality depends on
+            body data that hasn't been provided yet (e.g. a sequence that
+            ends mid-body, where it's not yet known whether the
+            ``Content-Length`` contract will be satisfied), the verdict
+            is reported as undetermined -- ``legal`` is :data:`None` and
+            ``undetermined`` is ``True`` -- rather than guessed.
+
+        Raises:
+            LocalProtocolError: if the connection is already in
+                :data:`ERROR`, in which case no events could possibly be
+                sent. The real connection is left in :data:`ERROR`.
+
+        """
+        if self.our_state is ERROR:
+            raise LocalProtocolError("Can't send data when our state is ERROR")
+
+        if isinstance(event, Event):
+            events = (event,)
+        else:
+            # Materialize here so that (a) we know each event's position,
+            # and (b) the caller gets a re-iterable copy back on the
+            # result.
+            events = tuple(event)
+
+        # All the simulation happens on a copy, so no matter what happens
+        # the real connection is untouched.
+        sim = deepcopy(self)
+
+        def discard(chunk: Any) -> None:
+            pass
+
+        event_results: List[SendPreflightEventResult] = []
+        framing: Optional[Framing] = self._active_body_framing(sim)
+        failed_at: Optional[int] = None
+        error: Optional[LocalProtocolError] = None
+
+        for index, original_event in enumerate(events):
+            states_before = dict(sim._cstate.states)
+            checked_event = original_event
+            event_framing: Optional[Framing] = None
+            legal = True
+            try:
+                checked_event = sim._write_event(original_event, discard)
+            except LocalProtocolError as exc:
+                # Mirror send(): the failed event puts us into ERROR.
+                sim._process_error(sim.our_role)
+                legal = False
+                failed_at = index
+                error = exc
+
+            if legal and sim.our_state is SEND_BODY:
+                if states_before[sim.our_role] is not SEND_BODY:
+                    framing = self._predict_framing(sim, checked_event)
+                    event_framing = framing
+            event_results.append(
+                SendPreflightEventResult(
+                    index=index,
+                    event=original_event,
+                    legal=legal,
+                    framing=event_framing,
+                    states_before=states_before,
+                    states_after=dict(sim._cstate.states),
+                    waiting_for_100_continue_after=(
+                        sim.client_is_waiting_for_100_continue
+                    ),
+                )
+            )
+            if not legal:
+                break
+
+        if failed_at is not None:
+            legal_verdict: Optional[bool] = False
+        elif sim.our_state is SEND_BODY:
+            # The sequence stopped in the middle of a message. Whether the
+            # message will eventually be legal depends on the rest of the
+            # body (e.g. whether the Content-Length contract is met),
+            # which we haven't seen yet.
+            legal_verdict = None
+        else:
+            legal_verdict = True
+
+        return SendPreflightResult(
+            events=events,
+            event_results=tuple(event_results),
+            failed_at=failed_at,
+            error=error,
+            legal=legal_verdict,
+            framing=framing,
+            states=dict(sim._cstate.states),
+            client_is_waiting_for_100_continue=sim.client_is_waiting_for_100_continue,
+        )
+
+    @staticmethod
+    def _predict_framing(sim: "Connection", event: Event) -> Framing:
+        # Must match the framing that _get_io_object actually picks when
+        # entering SEND_BODY.
+        method = sim._request_method
+        framing_type, args = _body_framing(
+            cast(bytes, method), cast(Union[Request, Response], event)
+        )
+        length: Optional[int]
+        if framing_type == "content-length":
+            (length,) = cast(Tuple[int], args)
+        else:
+            length = None
+        return Framing(kind=framing_type, length=length)
+
+    @staticmethod
+    def _active_body_framing(sim: "Connection") -> Optional[Framing]:
+        # Framing for a body that was already open when the preflight
+        # started, derived from the live writer. The declared total length
+        # isn't recoverable from the writer at this point, so only the
+        # mode is reported for content-length framing.
+        if sim.our_state is not SEND_BODY or sim._writer is None:
+            return None
+        writer = sim._writer
+        if isinstance(writer, ContentLengthWriter):
+            return Framing(kind="content-length")
+        if isinstance(writer, ChunkedWriter):
+            return Framing(kind="chunked")
+        if isinstance(writer, Http10Writer):
+            return Framing(kind="http/1.0")
+        return None
 
     # When sending a Response, we take responsibility for a few things:
     #

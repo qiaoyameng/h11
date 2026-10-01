@@ -2,7 +2,16 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
 import pytest
 
-from .._connection import _body_framing, _keep_alive, Connection, NEED_DATA, PAUSED
+from .._connection import (
+    _body_framing,
+    _keep_alive,
+    Connection,
+    Framing,
+    NEED_DATA,
+    PAUSED,
+    SendPreflightEventResult,
+    SendPreflightResult,
+)
 from .._events import (
     ConnectionClosed,
     Data,
@@ -16,6 +25,7 @@ from .._state import (
     CLOSED,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
     MUST_CLOSE,
     SEND_BODY,
@@ -1118,3 +1128,446 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
     with pytest.raises(RemoteProtocolError) as excinfo:
         c.next_event()
     assert "incomplete chunked read" in str(excinfo.value)
+
+
+################################################################
+# Connection.preflight_send
+################################################################
+
+
+def _server_with_request(raw_request: bytes = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"):
+    c = Connection(SERVER)
+    c.receive_data(raw_request)
+    assert type(c.next_event()) is Request
+    return c
+
+
+def test_preflight_send_accepts_single_event_and_iterables() -> None:
+    c = Connection(CLIENT)
+    request = Request(method="GET", target="/", headers=[("Host", "x")])
+
+    single = c.preflight_send(request)
+    assert isinstance(single, SendPreflightResult)
+    # A bare Request opens a Content-Length: 0 body that hasn't been
+    # terminated yet, so the final verdict is pending.
+    assert single.legal is None
+    assert single.failed_at is None
+    assert single.error is None
+    assert single.events == (request,)
+
+    listed = c.preflight_send(
+        [
+            Request(method="GET", target="/", headers=[("Host", "x")]),
+            EndOfMessage(),
+        ]
+    )
+    assert listed.legal is True
+    assert [type(e) for e in listed.events] == [Request, EndOfMessage]
+
+    # Connection state is untouched by any of these.
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+
+
+def test_preflight_send_predicts_framing() -> None:
+    c = Connection(CLIENT)
+    result = c.preflight_send(
+        [
+            Request(
+                method="POST",
+                target="/",
+                headers=[("Host", "x"), ("Content-Length", "11")],
+            ),
+            Data(data=b"hello world"),
+            EndOfMessage(),
+        ]
+    )
+    assert result.legal is True
+    assert result.framing == Framing(kind="content-length", length=11)
+    header_result = result.event_results[0]
+    assert header_result.framing == Framing(kind="content-length", length=11)
+    assert result.event_results[1].framing is None
+    assert result.event_results[2].framing is None
+
+    c = Connection(CLIENT)
+    result = c.preflight_send(
+        [
+            Request(
+                method="POST",
+                target="/",
+                headers=[("Host", "x"), ("Transfer-Encoding", "chunked")],
+            ),
+            Data(data=b"abc"),
+            EndOfMessage(),
+        ]
+    )
+    assert result.legal is True
+    assert result.framing == Framing(kind="chunked", length=None)
+
+
+def test_preflight_send_reports_failed_event_position() -> None:
+    c = _server_with_request()
+
+    bad = [
+        Response(status_code=200, headers=[("Content-Length", "10")]),
+        Data(data=b"only 9!"),
+        EndOfMessage(),
+    ]
+    result = c.preflight_send(bad)
+
+    # The header and body data are fine; the EndOfMessage reveals that the
+    # declared Content-Length was not satisfied.
+    assert result.legal is False
+    assert result.failed_at == 2
+    assert isinstance(result.error, LocalProtocolError)
+    assert "Too little data" in str(result.error)
+    assert len(result.event_results) == 3
+    assert all(r.legal for r in result.event_results[:2])
+    assert result.event_results[2].legal is False
+    assert result.event_results[2].states_after[SERVER] is ERROR
+
+    # Sending too much data fails at the Data event instead.
+    result = c.preflight_send(
+        [
+            Response(status_code=200, headers=[("Content-Length", "3")]),
+            Data(data=b"four"),
+            EndOfMessage(),
+        ]
+    )
+    assert result.legal is False
+    assert result.failed_at == 1
+    assert "Too much data" in str(result.error)
+
+    # State-machine errors are reported too.
+    result = c.preflight_send(
+        Request(method="GET", target="/", headers=[("Host", "x")])
+    )
+    assert result.legal is False
+    assert result.failed_at == 0
+
+
+def test_preflight_send_bad_then_real_good_on_same_connection() -> None:
+    c = _server_with_request()
+    states_before = c.states
+
+    bad = [
+        Response(status_code=200, headers=[("Content-Length", "10")]),
+        Data(data=b"only 9!"),
+        EndOfMessage(),
+    ]
+    pre = c.preflight_send(iter(bad))
+    assert pre.legal is False
+    assert pre.failed_at == 2
+
+    # The failed preflight changed nothing: the connection is still waiting
+    # to send a response.
+    assert c.states == states_before
+    assert c.our_state is SEND_RESPONSE
+
+    # A correct sequence sent for real on the same connection succeeds and
+    # reaches the same "legal" verdict the preflight predicted.
+    good = [
+        Response(status_code=200, headers=[("Content-Length", "5")]),
+        Data(data=b"hello"),
+        EndOfMessage(),
+    ]
+    good_pre = c.preflight_send(good)
+    assert good_pre.legal is True
+    for event in good:
+        c.send(event)
+    assert c.states == good_pre.states
+    assert c.our_state is DONE
+
+
+def test_preflight_send_predicts_state_transitions() -> None:
+    c = Connection(CLIENT)
+    result = c.preflight_send(
+        [
+            Request(method="GET", target="/", headers=[("Host", "x")]),
+            EndOfMessage(),
+            ConnectionClosed(),
+        ]
+    )
+
+    assert result.event_results[0].states_before == {CLIENT: IDLE, SERVER: IDLE}
+    assert result.event_results[0].states_after == {
+        CLIENT: SEND_BODY,
+        SERVER: SEND_RESPONSE,
+    }
+    assert result.event_results[1].states_after == {CLIENT: DONE, SERVER: SEND_RESPONSE}
+    assert result.event_results[2].states_after == {
+        CLIENT: CLOSED,
+        SERVER: SEND_RESPONSE,
+    }
+    assert result.states == {CLIENT: CLOSED, SERVER: SEND_RESPONSE}
+
+    # Nothing happened to the real connection.
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+
+
+def test_preflight_send_undetermined_for_unfinished_body() -> None:
+    c = Connection(CLIENT)
+    request = Request(
+        method="POST", target="/", headers=[("Host", "x"), ("Content-Length", "10")]
+    )
+
+    # Empty check in the middle of nothing is fine.
+    assert c.preflight_send([]).legal is True
+
+    # Stops mid-body: we can't know yet whether the remaining data will
+    # match the declared length.
+    result = c.preflight_send([request, Data(data=b"123")])
+    assert result.legal is None
+    assert result.undetermined is True
+    assert result.failed_at is None
+    assert result.framing == Framing(kind="content-length", length=10)
+    assert result.states[CLIENT] is SEND_BODY
+
+    # Completing the body turns the verdict into a definite True/False.
+    complete = c.preflight_send([request, Data(data=b"123"), EndOfMessage()])
+    assert complete.legal is False
+    assert complete.failed_at == 2
+
+    exact = c.preflight_send(
+        [
+            Request(
+                method="POST",
+                target="/",
+                headers=[("Host", "x"), ("Content-Length", "3")],
+            ),
+            Data(data=b"123"),
+            EndOfMessage(),
+        ]
+    )
+    assert exact.legal is True
+
+
+def test_preflight_send_100_continue() -> None:
+    # Server side: a request with Expect: 100-continue puts the client into
+    # the waiting state; sending any response clears it.
+    c = _server_with_request(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: x\r\n"
+        b"Expect: 100-continue\r\n"
+        b"Content-Length: 5\r\n\r\n"
+    )
+    assert c.they_are_waiting_for_100_continue
+
+    result = c.preflight_send([InformationalResponse(status_code=100, headers=[])])
+    assert result.legal is True
+    assert result.client_is_waiting_for_100_continue is False
+    assert result.event_results[0].waiting_for_100_continue_after is False
+
+    # The preflight didn't actually answer the peer.
+    assert c.they_are_waiting_for_100_continue
+
+    # Looking at just the request's arrival from the *client* side: before
+    # any body data is sent, the client is waiting.
+    client = Connection(CLIENT)
+    request = Request(
+        method="POST",
+        target="/",
+        headers=[
+            ("Host", "x"),
+            ("Expect", "100-continue"),
+            ("Content-Length", "5"),
+        ],
+    )
+    after_request = client.preflight_send([request])
+    assert after_request.legal is None
+    assert after_request.client_is_waiting_for_100_continue is True
+
+    # Sending body data gives up on waiting.
+    after_data = client.preflight_send([request, Data(data=b"hello"), EndOfMessage()])
+    assert after_data.legal is True
+    assert after_data.client_is_waiting_for_100_continue is False
+
+
+def test_preflight_send_head_request_rules() -> None:
+    c = _server_with_request(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    # A HEAD response always frames as Content-Length: 0, regardless of the
+    # declared length, so EndOfMessage is legal without any Data.
+    result = c.preflight_send(
+        [
+            Response(status_code=200, headers=[("Content-Length", "100")]),
+            EndOfMessage(),
+        ]
+    )
+    assert result.legal is True
+    assert result.framing == Framing(kind="content-length", length=0)
+    assert result.states[SERVER] is DONE
+
+    # ...and sending body data for a HEAD is an error.
+    result = c.preflight_send(
+        [
+            Response(status_code=200, headers=[("Content-Length", "100")]),
+            Data(data=b"x"),
+        ]
+    )
+    assert result.legal is False
+    assert result.failed_at == 1
+
+    # With no framing headers at all, a HEAD response is still CL: 0
+    # (rather than becoming chunked or http/1.0).
+    result = c.preflight_send([Response(status_code=200, headers=[])])
+    assert result.framing == Framing(kind="content-length", length=0)
+
+
+def test_preflight_send_does_not_consume_payloads_or_generate_body() -> None:
+    class OneShotPayload:
+        def __init__(self, n: int) -> None:
+            self.n = n
+            self.touched = False
+
+        def __len__(self) -> int:
+            return self.n
+
+        def __bytes__(self) -> bytes:
+            self.touched = True
+            return b"x" * self.n
+
+    c = Connection(CLIENT)
+    payload = OneShotPayload(5)
+    request = Request(
+        method="POST", target="/", headers=[("Host", "x"), ("Content-Length", "5")]
+    )
+    result = c.preflight_send([request, Data(data=payload), EndOfMessage()])
+    assert result.legal is True
+    # The payload was measured, but never serialized or consumed.
+    assert not payload.touched
+
+    # It can still be used for the real send.
+    assert c.send(request) == (
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"
+    )
+    assert c.send_with_data_passthrough(Data(data=payload)) == [payload]
+    assert c.send(EndOfMessage()) == b""
+
+
+def test_preflight_send_returns_replayable_events_for_one_shot_iterator() -> None:
+    c = Connection(CLIENT)
+
+    def events():
+        yield Request(method="GET", target="/", headers=[("Host", "x")])
+        yield EndOfMessage()
+
+    result = c.preflight_send(events())
+    assert result.legal is True
+
+    # The caller's iterator was drained during the check, but the same
+    # events are handed back for the real send.
+    assert [type(e).__name__ for e in result.events] == ["Request", "EndOfMessage"]
+    for event in result.events:
+        c.send(event)
+    assert c.our_state is DONE
+
+    # Lists/tuples are left usable directly as well.
+    sequence = [Request(method="GET", target="/", headers=[("Host", "y")])]
+    other = Connection(CLIENT)
+    other.preflight_send(sequence)
+    assert len(sequence) == 1
+
+
+def test_preflight_send_does_not_touch_receive_state() -> None:
+    c = _server_with_request(
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"
+    )
+    # Simulate some buffered-but-unprocessed body data.
+    c.receive_data(b"abc")
+    snapshot = (
+        bytes(c._receive_buffer),
+        c._receive_buffer_closed,
+        c.their_http_version,
+        c._request_method,
+    )
+
+    result = c.preflight_send(
+        [Response(status_code=200, headers=[("Content-Length", "2")])]
+    )
+    assert result.legal is None
+
+    assert (
+        bytes(c._receive_buffer),
+        c._receive_buffer_closed,
+        c.their_http_version,
+        c._request_method,
+    ) == snapshot
+
+    # The buffered data is still there to be read.
+    assert c.next_event() == Data(data=b"abc")
+
+
+def test_preflight_send_connection_closed() -> None:
+    c = Connection(CLIENT)
+    c.send(Request(method="GET", target="/", headers=[("Host", "x")]))
+    c.send(EndOfMessage())
+
+    result = c.preflight_send(ConnectionClosed())
+    assert result.legal is True
+    assert result.failed_at is None
+    assert result.framing is None
+    assert result.states[CLIENT] is CLOSED
+    assert c.our_state is DONE
+
+
+def test_preflight_send_from_error_state_raises() -> None:
+    c = Connection(CLIENT)
+    c.send_failed()
+    assert c.our_state is ERROR
+    with pytest.raises(LocalProtocolError):
+        c.preflight_send([Request(method="GET", target="/", headers=[("Host", "x")])])
+    assert c.our_state is ERROR
+
+
+def test_preflight_send_starting_mid_body() -> None:
+    # A preflight that starts while a body is already open still reports
+    # the active framing.
+    c = Connection(CLIENT)
+    c.send(
+        Request(
+            method="POST",
+            target="/",
+            headers=[("Host", "x"), ("Transfer-Encoding", "chunked")],
+        )
+    )
+    result = c.preflight_send([Data(data=b"ab"), EndOfMessage()])
+    assert result.legal is True
+    assert result.framing == Framing(kind="chunked")
+
+    # For content-length, the declared total isn't recoverable from the
+    # live writer, so length is left as None.
+    c = Connection(CLIENT)
+    c.send(
+        Request(
+            method="POST",
+            target="/",
+            headers=[("Host", "x"), ("Content-Length", "5")],
+        )
+    )
+    c.send(Data(data=b"ab"))
+    result = c.preflight_send([Data(data=b"cde"), EndOfMessage()])
+    assert result.legal is True
+    assert result.framing == Framing(kind="content-length")
+
+    # Overrunning the remaining allowance is caught at the first event.
+    result = c.preflight_send([Data(data=b"xxxx"), EndOfMessage()])
+    assert result.legal is False
+    assert result.failed_at == 0
+    assert c.our_state is SEND_BODY
+
+
+def test_preflight_send_http_1_0_unknown_length_framing() -> None:
+    c = Connection(SERVER)
+    c.receive_data(b"GET / HTTP/1.0\r\n\r\n")
+    assert type(c.next_event()) is Request
+
+    result = c.preflight_send([Response(status_code=200, headers=[])])
+    assert result.legal is None
+    assert result.framing == Framing(kind="http/1.0")
+
+    # Finishing the body forces the connection closed.
+    complete = c.preflight_send(
+        [Response(status_code=200, headers=[]), Data(data=b"hi"), EndOfMessage()]
+    )
+    assert complete.legal is True
+    assert complete.states[SERVER] is MUST_CLOSE

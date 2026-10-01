@@ -1,0 +1,6 @@
+Add :meth:`h11.Connection.preflight_send`, which checks whether one or
+more events could legally be sent without mutating the connection,
+generating body bytes, or consuming one-shot payload objects. It
+returns the predicted body framing, the position of the first failing
+event, the predicted states, and an explicit "undetermined" verdict
+when legality depends on body data that hasn't been provided yet.

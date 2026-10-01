@@ -398,6 +398,7 @@ The Connection object
    .. automethod:: next_event
    .. automethod:: send
    .. automethod:: send_with_data_passthrough
+   .. automethod:: preflight_send
    .. automethod:: send_failed
 
    .. automethod:: start_next_cycle
@@ -837,6 +838,87 @@ deliver events as they arrive. Something like:
 And your code that uses this will have to remember to check for
 :attr:`~Connection.they_are_waiting_for_100_continue` at the
 appropriate time.
+
+
+.. _preflight-send:
+
+Pre-checking sends
+------------------
+
+Sometimes you want to know *in advance* whether a sequence of events
+would be legal to send -- for example, to check that the body you're
+about to produce will actually match the ``Content-Length`` you
+already committed to in the response headers, before you start
+writing bytes to the socket. :meth:`Connection.preflight_send` does
+exactly this: it runs the same checks :meth:`send` would, but on a
+throwaway copy of the connection.
+
+.. code-block:: python
+
+   result = conn.preflight_send(
+       [
+           h11.Response(status_code=200,
+                        headers=[("Content-Length", str(len(body)))]),
+           h11.Data(data=body),
+           h11.EndOfMessage(),
+       ]
+   )
+   if not result.legal:
+       # result.failed_at is the index of the offending event, and
+       # result.error is the exception that send() would have raised.
+       ...
+
+The returned :class:`SendPreflightResult` reports:
+
+* :attr:`~SendPreflightResult.legal` -- ``True`` if the whole sequence
+  is legal and complete, ``False`` if some event is illegal, or
+  :data:`None` (see :attr:`~SendPreflightResult.undetermined`) if the
+  sequence is valid so far but stops in the middle of a body, where the
+  final verdict depends on body data that hasn't been seen yet;
+* :attr:`~SendPreflightResult.failed_at` and
+  :attr:`~SendPreflightResult.error` -- the position of the first
+  failing event and the :exc:`LocalProtocolError` it would raise;
+* :attr:`~SendPreflightResult.framing` -- the predicted
+  :class:`Framing` for the message body (``"content-length"``,
+  ``"chunked"``, or ``"http/1.0"``);
+* :attr:`~SendPreflightResult.states` and
+  :attr:`~SendPreflightResult.client_is_waiting_for_100_continue` --
+  the state the connection would be in afterwards;
+* :attr:`~SendPreflightResult.event_results` -- the same information
+  on a per-event basis.
+
+Because the check runs on a copy, preflighting is side-effect free:
+the real connection's state is untouched, so the actual sends
+performed afterwards get exactly the same verdict. No body bytes are
+generated or buffered -- the payload objects inside :class:`Data`
+events are only inspected via :func:`len`, so one-shot payloads like
+the :ref:`sendfile` placeholders are not consumed. If you pass a
+one-shot iterator of events, the iterator itself *is* consumed by the
+check; pass a list instead, or iterate the
+:attr:`~SendPreflightResult.events` tuple returned on the result to
+perform the actual sends.
+
+.. ipython:: python
+
+   import h11
+
+   conn = h11.Connection(h11.CLIENT)
+   result = conn.preflight_send(
+       [h11.Request(method="POST", target="/",
+                    headers=[("Host", "example.com"),
+                             ("Content-Length", "5")]),
+        h11.Data(data=b"oops")]
+   )
+   result.legal
+   result.undetermined
+   result.framing
+   conn.our_state
+
+.. autoclass:: Framing
+.. autoclass:: SendPreflightEventResult
+.. autoclass:: SendPreflightResult
+   :members: legal, undetermined, failed_at, error, framing, states,
+             client_is_waiting_for_100_continue, events, event_results
 
 
 .. _closing:
