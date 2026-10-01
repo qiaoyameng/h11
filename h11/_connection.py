@@ -1,10 +1,13 @@
 # This contains the main Connection class. Everything in h11 revolves around
 # this.
+import copy
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
     cast,
     Dict,
+    Iterable,
     List,
     Optional,
     overload,
@@ -45,7 +48,7 @@ from ._util import (  # Import the internal things we need
 from ._writers import WRITERS, WritersType
 
 # Everything in __all__ gets re-exported as part of the h11 public API.
-__all__ = ["Connection", "NEED_DATA", "PAUSED"]
+__all__ = ["Connection", "NEED_DATA", "PAUSED", "PredictedFraming", "PreflightResult"]
 
 
 class NEED_DATA(Sentinel, metaclass=Sentinel):
@@ -139,6 +142,81 @@ def _body_framing(
         return ("content-length", (0,))
     else:
         return ("http/1.0", ())
+
+
+@dataclass(frozen=True)
+class PredictedFraming:
+    """The body framing that :meth:`Connection.preflight_send` predicts for
+    a single message.
+
+    .. attribute:: event_index
+
+       The index, within the preflighted event sequence, of the
+       :class:`Request` or :class:`Response` event whose body this framing
+       applies to.
+
+    .. attribute:: kind
+
+       One of ``"content-length"``, ``"chunked"``, or ``"http/1.0"`` -- the
+       same framing categories that h11 uses internally when it enters the
+       :data:`SEND_BODY` state.
+
+    .. attribute:: content_length
+
+       For ``"content-length"`` framing, the declared body length in bytes.
+       For ``"chunked"`` and ``"http/1.0"`` framing the body length is not
+       known in advance, so this is ``None``, i.e. undetermined.
+
+    """
+
+    event_index: int
+    kind: str
+    content_length: Optional[int]
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    """The result of :meth:`Connection.preflight_send`.
+
+    .. attribute:: events
+
+       The events that were checked, as a list. If you passed a one-shot
+       iterator (e.g. a generator) to :meth:`Connection.preflight_send`,
+       then this is where the events were preserved -- iterate over this
+       attribute when performing the real sends.
+
+    .. attribute:: ok
+
+       ``True`` if every event in the sequence would be accepted by
+       :meth:`Connection.send`.
+
+    .. attribute:: failed_at
+
+       The index of the first event that :meth:`Connection.send` would
+       reject, or ``None`` if the whole sequence is legal. Events after
+       this index are not checked, because a real :meth:`Connection.send`
+       of the failing event would put the connection into the :data:`ERROR`
+       state.
+
+    .. attribute:: error
+
+       The :exc:`LocalProtocolError` that :meth:`Connection.send` would
+       raise for the event at ``failed_at``, or ``None`` if the whole
+       sequence is legal.
+
+    .. attribute:: framings
+
+       A tuple of :class:`PredictedFraming` objects, one for each
+       :class:`Request` or :class:`Response` event (before ``failed_at``)
+       that opens a message body.
+
+    """
+
+    events: List[Event]
+    ok: bool
+    failed_at: Optional[int]
+    error: Optional[LocalProtocolError]
+    framings: Tuple[PredictedFraming, ...]
 
 
 ################################################################
@@ -583,6 +661,98 @@ class Connection:
 
         """
         self._process_error(self.our_role)
+
+    def preflight_send(self, events: Iterable[Event]) -> PreflightResult:
+        """Check whether a sequence of events could be sent on this
+        connection, without changing any connection state and without
+        generating the serialized bytes.
+
+        Think of it as a "dry run" of :meth:`send`: the events are applied,
+        in order, to a private copy of this connection's state, using the
+        exact same validation logic as :meth:`send`. So afterwards, really
+        sending the same events on this connection will produce the same
+        accept/reject decisions -- and since the copy is discarded, this
+        connection is completely unaffected either way.
+
+        Only the legality of the events is checked; no message bytes are
+        generated, so this is cheap even for events carrying large bodies.
+
+        Args:
+            events: The candidate events, in the order you would pass them
+                to :meth:`send`. Any iterable is accepted, including a
+                one-shot iterator like a generator: the events are
+                materialized into a list and preserved as
+                :attr:`PreflightResult.events`, so the iterator is not
+                lost and can still be "sent" afterwards via the result.
+
+        Returns:
+            A :class:`PreflightResult` describing the predicted outcome:
+            whether the sequence is legal, the position of the first
+            failing event if not, and the predicted body framing of each
+            message. For messages whose body length is not known in
+            advance (``"chunked"`` or ``"http/1.0"`` framing), the
+            predicted :attr:`PredictedFraming.content_length` is ``None``,
+            i.e. undetermined.
+
+        """
+        event_list = list(events)
+        clone = copy.deepcopy(self)
+        framings: List[PredictedFraming] = []
+        failed_at: Optional[int] = None
+        error: Optional[LocalProtocolError] = None
+        for index, event in enumerate(event_list):
+            try:
+                framing = clone._simulate_send(event)
+            except LocalProtocolError as exc:
+                failed_at = index
+                error = exc
+                break
+            if framing is not None:
+                kind, content_length = framing
+                framings.append(PredictedFraming(index, kind, content_length))
+        return PreflightResult(
+            events=event_list,
+            ok=failed_at is None,
+            failed_at=failed_at,
+            error=error,
+            framings=tuple(framings),
+        )
+
+    def _simulate_send(self, event: Event) -> Optional[Tuple[str, Optional[int]]]:
+        # A dry-run version of send_with_data_passthrough: applies the event
+        # to (a throwaway copy of) our state and runs the appropriate writer
+        # with a sink, so all of send()'s validation happens but no bytes
+        # are produced. If the event opens a message body, returns the
+        # selected framing as (kind, content_length), where content_length
+        # is None when the body length is not known in advance.
+        if self.our_state is ERROR:
+            raise LocalProtocolError("Can't send data when our state is ERROR")
+        try:
+            if type(event) is Response:
+                event = self._clean_up_response_headers_for_sending(event)
+            # See send_with_data_passthrough for why we have to grab the
+            # writer before processing the event.
+            writer = self._writer
+            self._process_event(self.our_role, event)
+            if type(event) is ConnectionClosed:
+                return None
+            # In any situation where writer is None, process_event should
+            # have raised ProtocolError
+            assert writer is not None
+            writer(event, lambda data: None)
+            if type(event) in (Request, Response) and self.our_state is SEND_BODY:
+                framing_type, args = _body_framing(
+                    cast(bytes, self._request_method),
+                    cast(Union[Request, Response], event),
+                )
+                content_length: Optional[int] = None
+                if framing_type == "content-length":
+                    content_length = cast(Tuple[int], args)[0]
+                return (framing_type, content_length)
+            return None
+        except:
+            self._process_error(self.our_role)
+            raise
 
     # When sending a Response, we take responsibility for a few things:
     #

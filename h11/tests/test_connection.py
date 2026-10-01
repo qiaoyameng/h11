@@ -2,7 +2,14 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
 import pytest
 
-from .._connection import _body_framing, _keep_alive, Connection, NEED_DATA, PAUSED
+from .._connection import (
+    _body_framing,
+    _keep_alive,
+    Connection,
+    NEED_DATA,
+    PAUSED,
+    PredictedFraming,
+)
 from .._events import (
     ConnectionClosed,
     Data,
@@ -16,6 +23,7 @@ from .._state import (
     CLOSED,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
     MUST_CLOSE,
     SEND_BODY,
@@ -408,6 +416,208 @@ def test_100_continue() -> None:
     for conn in p.conns:
         assert not conn.client_is_waiting_for_100_continue
         assert not conn.they_are_waiting_for_100_continue
+
+
+def _post_request(
+    content_length: int, extra_headers: Optional[List[Tuple[str, str]]] = None
+) -> Request:
+    headers = [("Host", "example.com"), ("Content-Length", str(content_length))]
+    headers += extra_headers or []
+    return Request(method="POST", target="/", headers=headers)
+
+
+def test_preflight_send_error_then_good_sequence() -> None:
+    # Preflight a broken sequence, check the failure position and predicted
+    # framing, then send a correct sequence on the same connection.
+    c = Connection(CLIENT)
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+
+    # One byte too many for the declared Content-Length: the Data event at
+    # index 1 is the one that send() would reject.
+    bad_events = [
+        _post_request(5),
+        Data(data=b"123456"),
+        EndOfMessage(),
+    ]
+    # A one-shot iterator is accepted; the events are preserved in the
+    # result so they can still be sent afterwards.
+    result = c.preflight_send(iter(bad_events))
+    assert not result.ok
+    assert result.failed_at == 1
+    assert isinstance(result.error, LocalProtocolError)
+    assert "Too much data" in str(result.error)
+    assert list(result.events) == bad_events
+    assert result.framings == (
+        PredictedFraming(event_index=0, kind="content-length", content_length=5),
+    )
+    # The failed preflight left the connection completely untouched.
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+
+    # Too little data is caught at the EndOfMessage instead.
+    short_result = c.preflight_send(
+        [_post_request(5), Data(data=b"123"), EndOfMessage()]
+    )
+    assert not short_result.ok
+    assert short_result.failed_at == 2
+    assert isinstance(short_result.error, LocalProtocolError)
+    assert "Too little data" in str(short_result.error)
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+
+    # A correct sequence preflights cleanly...
+    good_result = c.preflight_send(
+        [_post_request(5), Data(data=b"12345"), EndOfMessage()]
+    )
+    assert good_result.ok
+    assert good_result.failed_at is None
+    assert good_result.error is None
+    assert good_result.framings == (
+        PredictedFraming(event_index=0, kind="content-length", content_length=5),
+    )
+    # ...and the connection is still pristine, so really sending the same
+    # events gives the same accept decisions and the expected transitions.
+    assert c.states == {CLIENT: IDLE, SERVER: IDLE}
+    c.send(good_result.events[0])
+    assert c.states == {CLIENT: SEND_BODY, SERVER: SEND_RESPONSE}
+    c.send(good_result.events[1])
+    assert c.states == {CLIENT: SEND_BODY, SERVER: SEND_RESPONSE}
+    c.send(good_result.events[2])
+    assert c.states == {CLIENT: DONE, SERVER: SEND_RESPONSE}
+
+
+def test_preflight_send_matches_send() -> None:
+    # The preflight accept/reject decision (and failure position) always
+    # matches what really sending the events would do.
+    sequences = [
+        [_post_request(5), Data(data=b"12345"), EndOfMessage()],
+        [_post_request(5), Data(data=b"123456"), EndOfMessage()],
+        [_post_request(5), Data(data=b"123"), EndOfMessage()],
+        [_post_request(0), EndOfMessage()],
+        # Illegal event for the state: client can't send a Response.
+        [Response(status_code=200, headers=[])],
+    ]
+    for events in sequences:
+        predicted = Connection(CLIENT).preflight_send(events)
+        actual_failed_at = None
+        c = Connection(CLIENT)
+        for index, event in enumerate(predicted.events):
+            try:
+                c.send(event)
+            except LocalProtocolError:
+                actual_failed_at = index
+                break
+        assert predicted.failed_at == actual_failed_at
+        assert predicted.ok == (actual_failed_at is None)
+
+
+def test_preflight_send_100_continue() -> None:
+    # Preflighting must not disturb the 100-continue handshake state.
+    request = _post_request(3, extra_headers=[("Expect", "100-continue")])
+
+    # Client side: preflighting the request doesn't start the wait.
+    c = Connection(CLIENT)
+    result = c.preflight_send([request, Data(data=b"abc"), EndOfMessage()])
+    assert result.ok
+    assert not c.client_is_waiting_for_100_continue
+    # Really sending it does.
+    request_bytes = cast(bytes, c.send(request))
+    assert c.client_is_waiting_for_100_continue
+
+    # Server side: preflighting "100 Continue + final response" doesn't
+    # consume the handshake or change any state.
+    server = Connection(SERVER)
+    server.receive_data(request_bytes)
+    assert type(server.next_event()) is Request
+    assert server.they_are_waiting_for_100_continue
+    assert server.states == {CLIENT: SEND_BODY, SERVER: SEND_RESPONSE}
+    result = server.preflight_send(
+        [
+            InformationalResponse(status_code=100, headers=[]),
+            Response(status_code=200, headers=[("Content-Length", "0")]),
+            EndOfMessage(),
+        ]
+    )
+    assert result.ok
+    # The InformationalResponse doesn't open a body, so only the final
+    # Response gets a framing entry.
+    assert result.framings == (
+        PredictedFraming(event_index=1, kind="content-length", content_length=0),
+    )
+    assert server.they_are_waiting_for_100_continue
+    assert server.states == {CLIENT: SEND_BODY, SERVER: SEND_RESPONSE}
+    # The real send of the same sequence works and clears the wait.
+    server.send(InformationalResponse(status_code=100, headers=[]))
+    assert not server.client_is_waiting_for_100_continue
+    server.send(Response(status_code=200, headers=[("Content-Length", "0")]))
+    server.send(EndOfMessage())
+    assert server.our_state is DONE
+
+
+def test_preflight_send_head_response() -> None:
+    # Responses to HEAD requests are framed as Content-Length: 0 no matter
+    # what the headers say, and preflight predicts exactly that.
+    client = Connection(CLIENT)
+    server = Connection(SERVER)
+    server.receive_data(
+        cast(
+            bytes,
+            client.send(
+                Request(method="HEAD", target="/", headers=[("Host", "example.com")])
+            ),
+        )
+    )
+    assert type(server.next_event()) is Request
+
+    events: List[Event] = [
+        Response(status_code=200, headers=[("Content-Length", "100")]),
+        EndOfMessage(),
+    ]
+    result = server.preflight_send(events)
+    assert result.ok
+    assert result.framings == (
+        PredictedFraming(event_index=0, kind="content-length", content_length=0),
+    )
+    assert server.our_state is SEND_RESPONSE
+    # Really sending agrees: no body may be sent, straight to DONE.
+    for event in result.events:
+        server.send(event)
+    assert server.our_state is DONE
+
+
+def test_preflight_send_undetermined_length() -> None:
+    # When the body length isn't known up front, the predicted framing says
+    # so explicitly (content_length is None).
+    client = Connection(CLIENT)
+    server = Connection(SERVER)
+    server.receive_data(
+        cast(
+            bytes,
+            client.send(
+                Request(method="GET", target="/", headers=[("Host", "example.com")])
+            ),
+        )
+    )
+    assert type(server.next_event()) is Request
+
+    # No Content-Length and an HTTP/1.1 peer: chunked, length undetermined.
+    result = server.preflight_send(
+        [Response(status_code=200, headers=[]), Data(data=b"x" * 100), EndOfMessage()]
+    )
+    assert result.ok
+    assert result.framings == (
+        PredictedFraming(event_index=0, kind="chunked", content_length=None),
+    )
+
+    # An HTTP/1.0 peer gets "http/1.0" framing instead; still undetermined.
+    server10 = Connection(SERVER)
+    server10.receive_data(b"GET / HTTP/1.0\r\n\r\n")
+    assert type(server10.next_event()) is Request
+    result10 = server10.preflight_send(
+        [Response(status_code=200, headers=[]), Data(data=b"x"), EndOfMessage()]
+    )
+    assert result10.ok
+    assert result10.framings == (
+        PredictedFraming(event_index=0, kind="http/1.0", content_length=None),
+    )
 
 
 def test_max_incomplete_event_size_countermeasure() -> None:

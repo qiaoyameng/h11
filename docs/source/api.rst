@@ -177,6 +177,10 @@ Here's the complete set of events supported by h11:
 
 .. autoclass:: ConnectionClosed
 
+.. autoclass:: PredictedFraming
+
+.. autoclass:: PreflightResult
+
 
 .. _state-machine:
 
@@ -399,6 +403,7 @@ The Connection object
    .. automethod:: send
    .. automethod:: send_with_data_passthrough
    .. automethod:: send_failed
+   .. automethod:: preflight_send
 
    .. automethod:: start_next_cycle
 
