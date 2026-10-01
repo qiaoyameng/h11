@@ -461,6 +461,7 @@ Most errors in h11 are signaled by raising one of
 .. autoexception:: ProtocolError
 .. autoexception:: LocalProtocolError
 .. autoexception:: RemoteProtocolError
+.. autoclass:: ErrorLocation
 
 There are four cases where these exceptions might be raised:
 

@@ -18,7 +18,7 @@ from .._readers import (
     Http10Reader,
     READERS,
 )
-from .._receivebuffer import ReceiveBuffer
+from .._receivebuffer import LocatedBytearray, ReceiveBuffer
 from .._state import CLIENT, IDLE, SEND_RESPONSE, SERVER
 from .._util import LocalProtocolError
 from .._writers import (
@@ -314,15 +314,16 @@ def test_readers_unusual() -> None:
 
 
 def test__obsolete_line_fold_bytes() -> None:
-    # _obsolete_line_fold has a defensive cast to bytearray, which is
-    # necessary to protect against O(n^2) behavior in case anyone ever passes
-    # in regular bytestrings... but right now we never pass in regular
-    # bytestrings. so this test just exists to get some coverage on that
-    # defensive cast.
-    assert list(_obsolete_line_fold([b"aaa", b"bbb", b"  ccc", b"ddd"])) == [
-        b"aaa",
-        bytearray(b"bbb ccc"),
-        b"ddd",
+    lines = [
+        LocatedBytearray(b"aaa", 0),
+        LocatedBytearray(b"bbb", 4),
+        LocatedBytearray(b"  ccc", 8),
+        LocatedBytearray(b"ddd", 14),
+    ]
+    assert list(_obsolete_line_fold(lines)) == [
+        (LocatedBytearray(b"aaa", 0), [(0, 3)]),
+        (LocatedBytearray(b"bbb ccc", 4), [(4, 3), (8, 5)]),
+        (LocatedBytearray(b"ddd", 14), [(14, 3)]),
     ]
 
 

@@ -1118,3 +1118,174 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
     with pytest.raises(RemoteProtocolError) as excinfo:
         c.next_event()
     assert "incomplete chunked read" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("data", "connection_offset", "fragment_type"),
+    [
+        (
+            b"GET /bad request HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            0,
+            "request_line",
+        ),
+        (
+            b"GET / HTTP/1.1\r\n folded\r\nHost: example.com\r\n\r\n",
+            16,
+            "header_fold",
+        ),
+        (
+            b"GET / HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Content-Length: 1\r\n"
+            b"Content-Length: 2\r\n\r\n",
+            54,
+            "content_length",
+        ),
+        (
+            b"POST / HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"ZZ\r\n",
+            66,
+            "chunk_size",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "chunk_sizes",
+    [
+        "whole",
+        "byte",
+        "uneven",
+    ],
+)
+def test_remote_protocol_error_locations(
+    data: bytes,
+    connection_offset: int,
+    fragment_type: str,
+    chunk_sizes: str,
+) -> None:
+    if chunk_sizes == "whole":
+        chunks = [len(data)]
+    elif chunk_sizes == "byte":
+        chunks = [1] * len(data)
+    else:
+        chunks = [2, 7, 1, 3, 5, 13, 4, 9, len(data)]
+
+    def pump(conn: Connection) -> Optional[RemoteProtocolError]:
+        while True:
+            try:
+                event = conn.next_event()
+            except RemoteProtocolError as exc:
+                return exc
+            if event in (NEED_DATA, PAUSED):
+                return None
+
+    conn = Connection(SERVER)
+    position = 0
+    error: Optional[RemoteProtocolError] = None
+    for chunk_size in chunks:
+        next_position = min(position + chunk_size, len(data))
+        conn.receive_data(data[position:next_position])
+        position = next_position
+        error = pump(conn)
+        if error is not None:
+            break
+
+    assert error is not None
+    assert error.connection_offset == connection_offset
+    assert error.message_offset == connection_offset
+    assert error.fragment_type == fragment_type
+    assert error.error_location is not None
+    assert not hasattr(error.error_location, "data")
+
+
+def test_remote_protocol_error_location_after_keepalive() -> None:
+    first_request = b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    second_request = b"GET /bad request HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    stream = first_request + second_request
+
+    def pump(conn: Connection) -> Optional[RemoteProtocolError]:
+        while True:
+            try:
+                event = conn.next_event()
+            except RemoteProtocolError as exc:
+                return exc
+            if event in (NEED_DATA, PAUSED):
+                return None
+
+    def run(chunk_size: int) -> RemoteProtocolError:
+        conn = Connection(SERVER)
+        position = 0
+        completed = False
+        error: Optional[RemoteProtocolError] = None
+        while position < len(stream):
+            next_position = min(position + chunk_size, len(stream))
+            conn.receive_data(stream[position:next_position])
+            position = next_position
+            error = pump(conn)
+            if error is not None:
+                return error
+            if not completed and conn.their_state is DONE:
+                conn.send(Response(status_code=200, headers=[]))
+                conn.send(EndOfMessage())
+                conn.start_next_cycle()
+                completed = True
+                error = pump(conn)
+                if error is not None:
+                    return error
+        raise AssertionError("expected RemoteProtocolError")
+
+    for chunk_size in [1, 7, 1024]:
+        exc = run(chunk_size)
+        assert exc.connection_offset == len(first_request)
+        assert exc.message_offset == 0
+        assert exc.fragment_type == "request_line"
+
+    first_body = b"x" * 1000
+    first_with_body = (
+        b"POST /one HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 1000\r\n\r\n" + first_body
+    )
+    body_stream = first_with_body + second_request
+
+    def run_body(chunk_size: int) -> RemoteProtocolError:
+        conn = Connection(SERVER)
+        position = 0
+        completed = False
+        error: Optional[RemoteProtocolError] = None
+        while position < len(body_stream):
+            next_position = min(position + chunk_size, len(body_stream))
+            conn.receive_data(body_stream[position:next_position])
+            position = next_position
+            error = pump(conn)
+            if error is not None:
+                return error
+            if not completed and conn.their_state is DONE:
+                conn.send(Response(status_code=200, headers=[]))
+                conn.send(EndOfMessage())
+                conn.start_next_cycle()
+                completed = True
+                error = pump(conn)
+                if error is not None:
+                    return error
+        raise AssertionError("expected RemoteProtocolError")
+
+    for chunk_size in [1, 17, 1024]:
+        exc = run_body(chunk_size)
+        assert exc.connection_offset == len(first_with_body)
+        assert exc.message_offset == 0
+        assert exc.fragment_type == "request_line"
+
+    conn = Connection(SERVER)
+    conn.receive_data(first_request)
+    get_all_events(conn)
+    conn.send(Response(status_code=200, headers=[]))
+    conn.send(EndOfMessage())
+    conn.start_next_cycle()
+    conn.receive_data(second_request)
+    with pytest.raises(RemoteProtocolError):
+        conn.next_event()
+    assert bytes(conn._receive_buffer) == b""
+    assert conn._receive_buffer.start_offset == len(stream)

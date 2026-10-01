@@ -29,16 +29,21 @@ from ._state import (
     _SWITCH_CONNECT,
     _SWITCH_UPGRADE,
     CLIENT,
+    CLOSED,
     ConnectionState,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
     SEND_BODY,
+    SEND_RESPONSE,
     SERVER,
     SWITCHED_PROTOCOL,
 )
 from ._util import (  # Import the internal things we need
+    ErrorLocation,
     LocalProtocolError,
+    ProtocolError,
     RemoteProtocolError,
     Sentinel,
 )
@@ -188,6 +193,8 @@ class Connection:
 
         # Holds any unprocessed received data
         self._receive_buffer = ReceiveBuffer()
+        self._active_receive_message = False
+        self._last_error_location: Optional[ErrorLocation] = None
         # If this is true, then it indicates that the incoming connection was
         # closed *after* the end of whatever's in self._receive_buffer:
         self._receive_buffer_closed = False
@@ -250,6 +257,7 @@ class Connection:
         # self.their_http_version gets left alone, since it presumably lasts
         # beyond a single request/response cycle
         assert not self.client_is_waiting_for_100_continue
+        self._active_receive_message = False
         self._respond_to_state_changes(old_states)
 
     def _process_error(self, role: Type[Sentinel]) -> None:
@@ -361,6 +369,29 @@ class Connection:
         """
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
+    def _activate_receive_reader(self) -> None:
+        state = self.their_state
+        starts_message = (
+            state in (IDLE, SEND_RESPONSE)
+            and self._reader is not None
+            and not self._active_receive_message
+        )
+        if starts_message:
+            self._receive_buffer.begin_message()
+            self._active_receive_message = True
+        elif state in (DONE, CLOSED):
+            self._active_receive_message = False
+
+    def _unexpected_eof_location(self) -> ErrorLocation:
+        has_line = b"\n" in bytes(self._receive_buffer)
+        if self.their_role is CLIENT or self.their_state is SEND_RESPONSE:
+            fragment_type = "header" if has_line else "status_line"
+        else:
+            fragment_type = "header" if has_line else "request_line"
+        return self._receive_buffer.error_location(
+            fragment_type, self._receive_buffer.end_offset
+        )
+
     def receive_data(self, data: bytes) -> None:
         """Add data to our internal receive buffer.
 
@@ -418,8 +449,12 @@ class Connection:
         if state is DONE and self._receive_buffer:
             return PAUSED
         if state is MIGHT_SWITCH_PROTOCOL or state is SWITCHED_PROTOCOL:
+            self._active_receive_message = False
             return PAUSED
+        if self._reader is None:
+            self._active_receive_message = False
         assert self._reader is not None
+        self._activate_receive_reader()
         event = self._reader(self._receive_buffer)
         if event is None:
             if not self._receive_buffer and self._receive_buffer_closed:
@@ -428,7 +463,7 @@ class Connection:
                 # return that event, and then the state will change and we'll
                 # get called again to generate the actual ConnectionClosed().
                 if hasattr(self._reader, "read_eof"):
-                    event = self._reader.read_eof()
+                    event = self._reader.read_eof(self._receive_buffer)
                 else:
                     event = ConnectionClosed()
         if event is None:
@@ -476,7 +511,10 @@ class Connection:
         """
 
         if self.their_state is ERROR:
-            raise RemoteProtocolError("Can't receive data when peer state is ERROR")
+            raise RemoteProtocolError(
+                "Can't receive data when peer state is ERROR",
+                error_location=self._last_error_location,
+            )
         try:
             event = self._extract_next_receive_event()
             if event not in [NEED_DATA, PAUSED]:
@@ -486,19 +524,28 @@ class Connection:
                     # 431 is "Request header fields too large" which is pretty
                     # much the only situation where we can get here
                     raise RemoteProtocolError(
-                        "Receive buffer too long", error_status_hint=431
+                        "Receive buffer too long",
+                        error_status_hint=431,
+                        error_location=self._unexpected_eof_location(),
                     )
                 if self._receive_buffer_closed:
                     # We're still trying to complete some event, but that's
                     # never going to happen because no more data is coming
-                    raise RemoteProtocolError("peer unexpectedly closed connection")
+                    raise RemoteProtocolError(
+                        "peer unexpectedly closed connection",
+                        error_location=self._unexpected_eof_location(),
+                    )
             return event
-        except BaseException as exc:
+        except ProtocolError as exc:
+            self._last_error_location = exc.error_location
             self._process_error(self.their_role)
             if isinstance(exc, LocalProtocolError):
                 exc._reraise_as_remote_protocol_error()
             else:
                 raise
+        except BaseException:
+            self._process_error(self.their_role)
+            raise
 
     @overload
     def send(self, event: ConnectionClosed) -> None:

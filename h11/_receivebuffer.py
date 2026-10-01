@@ -2,7 +2,15 @@ import re
 import sys
 from typing import List, Optional, Union
 
-__all__ = ["ReceiveBuffer"]
+from ._util import ErrorLocation
+
+__all__ = ["ReceiveBuffer", "LocatedBytearray"]
+
+
+class LocatedBytearray(bytearray):
+    def __init__(self, data: bytes, connection_offset: int) -> None:
+        super().__init__(data)
+        self.connection_offset = connection_offset
 
 
 # Operations we want to support:
@@ -49,6 +57,10 @@ class ReceiveBuffer:
         self._data = bytearray()
         self._next_line_search = 0
         self._multiple_lines_search = 0
+        self._consumed = 0
+        self._message_start = 0
+        self._last_extract_start = 0
+        self._last_extract_end = 0
 
     def __iadd__(self, byteslike: Union[bytes, bytearray]) -> "ReceiveBuffer":
         self._data += byteslike
@@ -60,14 +72,45 @@ class ReceiveBuffer:
     def __len__(self) -> int:
         return len(self._data)
 
+    @property
+    def start_offset(self) -> int:
+        return self._consumed
+
+    @property
+    def end_offset(self) -> int:
+        return self._consumed + len(self._data)
+
+    def begin_message(self) -> None:
+        self._message_start = self._consumed
+
+    @property
+    def message_start_offset(self) -> int:
+        return self._message_start
+
+    def error_location(
+        self,
+        fragment_type: str,
+        connection_offset: Optional[int] = None,
+    ) -> ErrorLocation:
+        if connection_offset is None:
+            connection_offset = self._last_extract_start
+        return ErrorLocation(
+            connection_offset=connection_offset,
+            message_offset=connection_offset - self._message_start,
+            fragment_type=fragment_type,
+        )
+
     # for @property unprocessed_data
     def __bytes__(self) -> bytes:
         return bytes(self._data)
 
     def _extract(self, count: int) -> bytearray:
         # extracting an initial slice of the data buffer and return it
-        out = self._data[:count]
+        self._last_extract_start = self._consumed
+        out = LocatedBytearray(self._data[:count], self._consumed)
         del self._data[:count]
+        self._consumed += len(out)
+        self._last_extract_end = self._consumed
 
         self._next_line_search = 0
         self._multiple_lines_search = 0
@@ -101,7 +144,7 @@ class ReceiveBuffer:
 
         return self._extract(idx)
 
-    def maybe_extract_lines(self) -> Optional[List[bytearray]]:
+    def maybe_extract_lines(self) -> Optional[List[LocatedBytearray]]:
         """
         Extract everything up to the first blank line, and return a list of lines.
         """
@@ -123,11 +166,14 @@ class ReceiveBuffer:
         # Truncate the buffer and return it.
         idx = match.span(0)[-1]
         out = self._extract(idx)
-        lines = out.split(b"\n")
-
-        for line in lines:
+        lines = []
+        line_offset = out.connection_offset
+        for raw_line in out.split(b"\n"):
+            line = LocatedBytearray(raw_line, line_offset)
+            line_offset += len(raw_line) + 1
             if line.endswith(b"\r"):
                 del line[-1]
+            lines.append(line)
 
         assert lines[-2] == lines[-1] == b""
 

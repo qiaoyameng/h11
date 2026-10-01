@@ -1,12 +1,33 @@
-from typing import Any, Dict, NoReturn, Pattern, Tuple, Type, TypeVar, Union
+from dataclasses import dataclass
+from typing import Any, Dict, NoReturn, Optional, Pattern, Tuple, Type, TypeVar, Union
 
 __all__ = [
     "ProtocolError",
     "LocalProtocolError",
     "RemoteProtocolError",
+    "ErrorLocation",
     "validate",
     "bytesify",
 ]
+
+
+@dataclass(frozen=True)
+class ErrorLocation:
+    """Location of a protocol error in the received byte stream.
+
+    Attributes:
+        connection_offset: Zero-based byte offset from the start of the
+            connection.
+        message_offset: Zero-based byte offset from the start of the current
+            request or response.
+        fragment_type: HTTP wire fragment containing the error, such as
+            ``"request_line"``, ``"header"``, ``"header_fold"``,
+            ``"content_length"``, or ``"chunk_size"``.
+    """
+
+    connection_offset: int
+    message_offset: int
+    fragment_type: str
 
 
 class ProtocolError(Exception):
@@ -18,7 +39,8 @@ class ProtocolError(Exception):
     indicates that the remote peer tried to do something that HTTP/1.1 says is
     illegal. See :ref:`error-handling` for details.
 
-    In addition to the normal :exc:`Exception` features, it has one attribute:
+    In addition to the normal :exc:`Exception` features, it has these
+    attributes:
 
     .. attribute:: error_status_hint
 
@@ -36,13 +58,54 @@ class ProtocolError(Exception):
        The default is 400 Bad Request, a generic catch-all for protocol
        violations.
 
+    .. attribute:: error_location
+
+       An :class:`ErrorLocation` describing the byte offset and fragment
+       associated with a remote parsing error, or ``None``.
+
+    .. attribute:: connection_offset
+
+       Convenience accessor for ``error_location.connection_offset``.
+
+    .. attribute:: message_offset
+
+       Convenience accessor for ``error_location.message_offset``.
+
+    .. attribute:: fragment_type
+
+       Convenience accessor for ``error_location.fragment_type``.
+
     """
 
-    def __init__(self, msg: str, error_status_hint: int = 400) -> None:
+    def __init__(
+        self,
+        msg: str,
+        error_status_hint: int = 400,
+        error_location: Optional[ErrorLocation] = None,
+    ) -> None:
         if type(self) is ProtocolError:
             raise TypeError("tried to directly instantiate ProtocolError")
         Exception.__init__(self, msg)
         self.error_status_hint = error_status_hint
+        self.error_location = error_location
+
+    @property
+    def connection_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.connection_offset
+
+    @property
+    def message_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.message_offset
+
+    @property
+    def fragment_type(self) -> Optional[str]:
+        if self.error_location is None:
+            return None
+        return self.error_location.fragment_type
 
 
 # Strategy: there are a number of public APIs where a LocalProtocolError can
