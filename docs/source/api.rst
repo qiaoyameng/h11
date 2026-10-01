@@ -402,6 +402,9 @@ The Connection object
 
    .. automethod:: start_next_cycle
 
+   .. automethod:: snapshot
+   .. automethod:: from_snapshot
+
    .. attribute:: our_role
 
       :data:`CLIENT` if this is a client; :data:`SERVER` if this is a server.

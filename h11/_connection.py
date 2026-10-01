@@ -1,5 +1,7 @@
 # This contains the main Connection class. Everything in h11 revolves around
 # this.
+import base64
+import binascii
 from typing import (
     Any,
     Callable,
@@ -23,17 +25,27 @@ from ._events import (
     Response,
 )
 from ._headers import get_comma_header, has_expect_100_continue, set_comma_header
-from ._readers import READERS, ReadersType
+from ._readers import (
+    READERS,
+    ChunkedReader,
+    ContentLengthReader,
+    Http10Reader,
+    ReadersType,
+)
 from ._receivebuffer import ReceiveBuffer
 from ._state import (
     _SWITCH_CONNECT,
     _SWITCH_UPGRADE,
     CLIENT,
+    CLOSED,
     ConnectionState,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
+    MUST_CLOSE,
     SEND_BODY,
+    SEND_RESPONSE,
     SERVER,
     SWITCHED_PROTOCOL,
 )
@@ -42,7 +54,13 @@ from ._util import (  # Import the internal things we need
     RemoteProtocolError,
     Sentinel,
 )
-from ._writers import WRITERS, WritersType
+from ._writers import (
+    WRITERS,
+    ChunkedWriter,
+    ContentLengthWriter,
+    Http10Writer,
+    WritersType,
+)
 
 # Everything in __all__ gets re-exported as part of the h11 public API.
 __all__ = ["Connection", "NEED_DATA", "PAUSED"]
@@ -139,6 +157,191 @@ def _body_framing(
         return ("content-length", (0,))
     else:
         return ("http/1.0", ())
+
+
+################################################################
+#
+# Snapshot support (explicit state export / restore)
+#
+################################################################
+
+# Version of the snapshot format produced by Connection.snapshot() and
+# accepted by Connection.from_snapshot(). Bump this whenever the format
+# changes in a way that is not backwards-compatible; snapshots with any
+# other version are rejected.
+SNAPSHOT_FORMAT_VERSION = 1
+
+_STATE_BY_NAME: Dict[str, Type[Sentinel]] = {
+    state.__name__: state
+    for state in (
+        IDLE,
+        SEND_RESPONSE,
+        SEND_BODY,
+        DONE,
+        MUST_CLOSE,
+        CLOSED,
+        MIGHT_SWITCH_PROTOCOL,
+        SWITCHED_PROTOCOL,
+        ERROR,
+    )
+}
+
+_ROLE_BY_NAME: Dict[str, Type[Sentinel]] = {
+    "CLIENT": CLIENT,
+    "SERVER": SERVER,
+}
+
+_SWITCH_BY_NAME: Dict[str, Type[Sentinel]] = {
+    "_SWITCH_CONNECT": _SWITCH_CONNECT,
+    "_SWITCH_UPGRADE": _SWITCH_UPGRADE,
+}
+
+
+def _snapshot_error(msg: str) -> ValueError:
+    return ValueError(f"invalid h11 snapshot: {msg}")
+
+
+def _encode_bytes(data: Optional[bytes]) -> Optional[str]:
+    if data is None:
+        return None
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def _decode_bytes(value: Any, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise _snapshot_error(f"{field} must be a base64 string, got {value!r}")
+    try:
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError):
+        raise _snapshot_error(f"{field} is not valid base64: {value!r}") from None
+
+
+def _decode_optional_bytes(value: Any, field: str) -> Optional[bytes]:
+    if value is None:
+        return None
+    return _decode_bytes(value, field)
+
+
+def _decode_bool(value: Any, field: str) -> bool:
+    if type(value) is not bool:
+        raise _snapshot_error(f"{field} must be a bool, got {value!r}")
+    return value
+
+
+def _decode_int(value: Any, field: str, minimum: int = 0) -> int:
+    # NB: type(x) is int excludes bools
+    if type(value) is not int:
+        raise _snapshot_error(f"{field} must be an int, got {value!r}")
+    if value < minimum:
+        raise _snapshot_error(f"{field} must be >= {minimum}, got {value!r}")
+    return value
+
+
+def _snapshot_reader(
+    reader: Optional[Callable[..., Any]], their_state: Type[Sentinel]
+) -> Optional[Dict[str, Any]]:
+    # Readers for non-SEND_BODY states are stateless functions that can be
+    # re-derived from the state alone, so we only need to record body
+    # readers.
+    if their_state is not SEND_BODY:
+        return None
+    if isinstance(reader, ChunkedReader):
+        return {
+            "framing": "chunked",
+            "state": {
+                "bytes_in_chunk": reader._bytes_in_chunk,
+                "bytes_to_discard": _encode_bytes(reader._bytes_to_discard),
+                "reading_trailer": reader._reading_trailer,
+            },
+        }
+    if isinstance(reader, ContentLengthReader):
+        return {
+            "framing": "content-length",
+            "state": {
+                "length": reader._length,
+                "remaining": reader._remaining,
+            },
+        }
+    if isinstance(reader, Http10Reader):
+        return {"framing": "http/1.0", "state": {}}
+    raise TypeError(f"don't know how to snapshot reader {reader!r}")  # pragma: no cover
+
+
+def _restore_reader(entry: Any) -> Callable[..., Any]:
+    if not isinstance(entry, dict):
+        raise _snapshot_error(f"reader entry must be a dict, got {entry!r}")
+    framing = entry.get("framing")
+    state = entry.get("state")
+    if not isinstance(state, dict):
+        raise _snapshot_error(f"reader state must be a dict, got {state!r}")
+    if framing == "chunked":
+        reader = ChunkedReader()
+        reader._bytes_in_chunk = _decode_int(
+            state.get("bytes_in_chunk"), "reader.state.bytes_in_chunk"
+        )
+        bytes_to_discard = _decode_bytes(
+            state.get("bytes_to_discard"), "reader.state.bytes_to_discard"
+        )
+        # The only thing ever discarded is the \r\n chunk footer, so the
+        # pending discard must be a (remaining) suffix of it.
+        if not b"\r\n".endswith(bytes_to_discard):
+            raise _snapshot_error(
+                f"reader.state.bytes_to_discard must be a suffix of b'\\r\\n', "
+                f"got {bytes_to_discard!r}"
+            )
+        reader._bytes_to_discard = bytes_to_discard
+        reader._reading_trailer = _decode_bool(
+            state.get("reading_trailer"), "reader.state.reading_trailer"
+        )
+        return reader
+    if framing == "content-length":
+        length = _decode_int(state.get("length"), "reader.state.length")
+        remaining = _decode_int(state.get("remaining"), "reader.state.remaining")
+        if remaining > length:
+            raise _snapshot_error(
+                f"reader.state.remaining ({remaining}) exceeds "
+                f"reader.state.length ({length})"
+            )
+        reader = ContentLengthReader(length)
+        reader._remaining = remaining
+        return reader
+    if framing == "http/1.0":
+        return Http10Reader()
+    raise _snapshot_error(f"unknown reader framing: {framing!r}")
+
+
+def _snapshot_writer(
+    writer: Optional[Callable[..., Any]], our_state: Type[Sentinel]
+) -> Optional[Dict[str, Any]]:
+    if our_state is not SEND_BODY:
+        return None
+    if isinstance(writer, ContentLengthWriter):
+        return {
+            "framing": "content-length",
+            "state": {"remaining": writer._length},
+        }
+    if isinstance(writer, ChunkedWriter):
+        return {"framing": "chunked", "state": {}}
+    if isinstance(writer, Http10Writer):
+        return {"framing": "http/1.0", "state": {}}
+    raise TypeError(f"don't know how to snapshot writer {writer!r}")  # pragma: no cover
+
+
+def _restore_writer(entry: Any) -> Callable[..., Any]:
+    if not isinstance(entry, dict):
+        raise _snapshot_error(f"writer entry must be a dict, got {entry!r}")
+    framing = entry.get("framing")
+    state = entry.get("state")
+    if not isinstance(state, dict):
+        raise _snapshot_error(f"writer state must be a dict, got {state!r}")
+    if framing == "content-length":
+        remaining = _decode_int(state.get("remaining"), "writer.state.remaining")
+        return ContentLengthWriter(remaining)
+    if framing == "chunked":
+        return ChunkedWriter()
+    if framing == "http/1.0":
+        return Http10Writer()
+    raise _snapshot_error(f"unknown writer framing: {framing!r}")
 
 
 ################################################################
@@ -360,6 +563,184 @@ class Connection:
         See :ref:`switching-protocols` for discussion of why you'd want this.
         """
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Export this connection's complete state as a plain-data snapshot.
+
+        The returned value is a dict containing only plain, JSON-safe data
+        (strings, integers, booleans, ``None``, lists, and dicts -- binary
+        data is base64-encoded). It contains no sockets, file objects, event
+        objects, or other live references, so it can be serialized (e.g. with
+        :mod:`json`), stored, and later passed to :meth:`from_snapshot` --
+        possibly in a different process -- to resume parsing exactly where
+        this connection left off, without re-parsing any already-consumed
+        bytes.
+
+        The snapshot captures: our role, the full state machine state
+        (including keep-alive and pending protocol-switch proposals), the
+        body framing in progress (including partial chunk headers and
+        content-length bookkeeping), the 100-continue flow-control flag, and
+        any received-but-unconsumed bytes.
+
+        The format is versioned (see the ``"version"`` key) and does not use
+        :mod:`pickle`; snapshots produced by a different format version are
+        rejected by :meth:`from_snapshot`.
+        """
+        return {
+            "version": SNAPSHOT_FORMAT_VERSION,
+            "role": self.our_role.__name__,
+            "max_incomplete_event_size": self._max_incomplete_event_size,
+            "states": {
+                role.__name__: state.__name__
+                for role, state in self._cstate.states.items()
+            },
+            "keep_alive": self._cstate.keep_alive,
+            "pending_switch_proposals": sorted(
+                switch.__name__ for switch in self._cstate.pending_switch_proposals
+            ),
+            "their_http_version": _encode_bytes(self.their_http_version),
+            "request_method": _encode_bytes(self._request_method),
+            "client_is_waiting_for_100_continue": (
+                self.client_is_waiting_for_100_continue
+            ),
+            "receive_buffer": _encode_bytes(bytes(self._receive_buffer)),
+            "receive_buffer_closed": self._receive_buffer_closed,
+            "reader": _snapshot_reader(self._reader, self.their_state),
+            "writer": _snapshot_writer(self._writer, self.our_state),
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Dict[str, Any]) -> "Connection":
+        """Restore a connection previously exported with :meth:`snapshot`.
+
+        The restored connection is indistinguishable from the original:
+        feeding it the bytes that would have come next produces the same
+        events, and :meth:`send` accepts the same events, as if parsing had
+        never been interrupted.
+
+        Raises:
+            ValueError:
+                If *snapshot* is not a valid h11 snapshot: if it was produced
+                by an incompatible snapshot format version, if it contains
+                unknown role/state/framing names, or if any of its fields
+                are malformed (e.g. invalid lengths or corrupt base64 data).
+        """
+        if not isinstance(snapshot, dict):
+            raise _snapshot_error(f"snapshot must be a dict, got {snapshot!r}")
+
+        version = snapshot.get("version")
+        if version != SNAPSHOT_FORMAT_VERSION:
+            raise _snapshot_error(
+                f"incompatible snapshot version {version!r} "
+                f"(this version of h11 supports {SNAPSHOT_FORMAT_VERSION})"
+            )
+
+        role_name = snapshot.get("role")
+        if role_name not in _ROLE_BY_NAME:
+            raise _snapshot_error(f"unknown role: {role_name!r}")
+        our_role = _ROLE_BY_NAME[role_name]
+
+        max_incomplete_event_size = _decode_int(
+            snapshot.get("max_incomplete_event_size"),
+            "max_incomplete_event_size",
+            minimum=1,
+        )
+
+        state_names = snapshot.get("states")
+        if not isinstance(state_names, dict) or set(state_names) != {
+            "CLIENT",
+            "SERVER",
+        }:
+            raise _snapshot_error(
+                f"states must be a dict with CLIENT and SERVER keys, "
+                f"got {state_names!r}"
+            )
+        states: Dict[Type[Sentinel], Type[Sentinel]] = {}
+        for role_name2, state_name in state_names.items():
+            if state_name not in _STATE_BY_NAME:
+                raise _snapshot_error(f"unknown state: {state_name!r}")
+            states[_ROLE_BY_NAME[role_name2]] = _STATE_BY_NAME[state_name]
+
+        keep_alive = _decode_bool(snapshot.get("keep_alive"), "keep_alive")
+
+        switch_names = snapshot.get("pending_switch_proposals")
+        if not isinstance(switch_names, list):
+            raise _snapshot_error(
+                f"pending_switch_proposals must be a list, got {switch_names!r}"
+            )
+        pending_switch_proposals = set()
+        for switch_name in switch_names:
+            if switch_name not in _SWITCH_BY_NAME:
+                raise _snapshot_error(
+                    f"unknown pending switch proposal: {switch_name!r}"
+                )
+            pending_switch_proposals.add(_SWITCH_BY_NAME[switch_name])
+
+        their_http_version = _decode_optional_bytes(
+            snapshot.get("their_http_version"), "their_http_version"
+        )
+        request_method = _decode_optional_bytes(
+            snapshot.get("request_method"), "request_method"
+        )
+        client_is_waiting_for_100_continue = _decode_bool(
+            snapshot.get("client_is_waiting_for_100_continue"),
+            "client_is_waiting_for_100_continue",
+        )
+        receive_buffer = _decode_bytes(
+            snapshot.get("receive_buffer"), "receive_buffer"
+        )
+        receive_buffer_closed = _decode_bool(
+            snapshot.get("receive_buffer_closed"), "receive_buffer_closed"
+        )
+
+        reader_entry = snapshot.get("reader")
+        writer_entry = snapshot.get("writer")
+        their_state = states[SERVER] if our_role is CLIENT else states[CLIENT]
+        our_state = states[our_role]
+        # Body readers/writers carry framing state that must be restored
+        # explicitly; all other readers/writers are stateless and derived
+        # from the state machine, so a snapshot that disagrees about which
+        # kind it has is corrupt.
+        if their_state is SEND_BODY:
+            if reader_entry is None:
+                raise _snapshot_error(
+                    "their_state is SEND_BODY but snapshot has no reader entry"
+                )
+            reader: Optional[Callable[..., Any]] = _restore_reader(reader_entry)
+        else:
+            if reader_entry is not None:
+                raise _snapshot_error(
+                    f"snapshot has a reader entry but their_state is "
+                    f"{their_state.__name__}, not SEND_BODY"
+                )
+            their_role = SERVER if our_role is CLIENT else CLIENT
+            reader = READERS.get((their_role, their_state))  # type: ignore[assignment]
+        if our_state is SEND_BODY:
+            if writer_entry is None:
+                raise _snapshot_error(
+                    "our_state is SEND_BODY but snapshot has no writer entry"
+                )
+            writer: Optional[Callable[..., Any]] = _restore_writer(writer_entry)
+        else:
+            if writer_entry is not None:
+                raise _snapshot_error(
+                    f"snapshot has a writer entry but our_state is "
+                    f"{our_state.__name__}, not SEND_BODY"
+                )
+            writer = WRITERS.get((our_role, our_state))  # type: ignore[assignment]
+
+        conn = cls(our_role, max_incomplete_event_size=max_incomplete_event_size)
+        conn._cstate.states = states
+        conn._cstate.keep_alive = keep_alive
+        conn._cstate.pending_switch_proposals = pending_switch_proposals
+        conn.their_http_version = their_http_version
+        conn._request_method = request_method
+        conn.client_is_waiting_for_100_continue = client_is_waiting_for_100_continue
+        conn._receive_buffer += receive_buffer
+        conn._receive_buffer_closed = receive_buffer_closed
+        conn._reader = reader
+        conn._writer = writer
+        return conn
 
     def receive_data(self, data: bytes) -> None:
         """Add data to our internal receive buffer.
