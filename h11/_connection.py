@@ -1,13 +1,16 @@
 # This contains the main Connection class. Everything in h11 revolves around
 # this.
+import base64
 from typing import (
     Any,
     Callable,
     cast,
     Dict,
     List,
+    Mapping,
     Optional,
     overload,
+    Set,
     Tuple,
     Type,
     Union,
@@ -23,17 +26,27 @@ from ._events import (
     Response,
 )
 from ._headers import get_comma_header, has_expect_100_continue, set_comma_header
-from ._readers import READERS, ReadersType
+from ._readers import (
+    ChunkedReader,
+    ContentLengthReader,
+    Http10Reader,
+    READERS,
+    ReadersType,
+)
 from ._receivebuffer import ReceiveBuffer
 from ._state import (
     _SWITCH_CONNECT,
     _SWITCH_UPGRADE,
     CLIENT,
+    CLOSED,
     ConnectionState,
     DONE,
     ERROR,
+    IDLE,
     MIGHT_SWITCH_PROTOCOL,
+    MUST_CLOSE,
     SEND_BODY,
+    SEND_RESPONSE,
     SERVER,
     SWITCHED_PROTOCOL,
 )
@@ -42,7 +55,13 @@ from ._util import (  # Import the internal things we need
     RemoteProtocolError,
     Sentinel,
 )
-from ._writers import WRITERS, WritersType
+from ._writers import (
+    ChunkedWriter,
+    ContentLengthWriter,
+    Http10Writer,
+    WRITERS,
+    WritersType,
+)
 
 # Everything in __all__ gets re-exported as part of the h11 public API.
 __all__ = ["Connection", "NEED_DATA", "PAUSED"]
@@ -67,6 +86,227 @@ class PAUSED(Sentinel, metaclass=Sentinel):
 # - IIS: 16 * 1024
 # - Apache: <8 KiB per line>
 DEFAULT_MAX_INCOMPLETE_EVENT_SIZE = 16 * 1024
+STATE_FORMAT_VERSION = 1
+
+_ROLE_NAMES = {CLIENT: "client", SERVER: "server"}
+_ROLES_BY_NAME = {value: key for key, value in _ROLE_NAMES.items()}
+_STATE_NAMES = {
+    state: state.__name__
+    for state in (
+        CLIENT,
+        SERVER,
+        DONE,
+        SEND_BODY,
+        SEND_RESPONSE,
+        MIGHT_SWITCH_PROTOCOL,
+        SWITCHED_PROTOCOL,
+        ERROR,
+        IDLE,
+        MUST_CLOSE,
+        CLOSED,
+    )
+}
+_STATES_BY_NAME = {
+    name: state for state, name in _STATE_NAMES.items() if state not in (CLIENT, SERVER)
+}
+_SWITCH_NAMES = {_SWITCH_CONNECT: "connect", _SWITCH_UPGRADE: "upgrade"}
+_SWITCHES_BY_NAME = {value: key for key, value in _SWITCH_NAMES.items()}
+
+_READER_TYPES = {
+    "chunked": ChunkedReader,
+    "content-length": ContentLengthReader,
+    "http/1.0": Http10Reader,
+}
+_WRITER_TYPES = {
+    "chunked": ChunkedWriter,
+    "content-length": ContentLengthWriter,
+    "http/1.0": Http10Writer,
+}
+_COMPATIBLE_STATES = {
+    IDLE: (IDLE, SEND_RESPONSE, ERROR),
+    SEND_RESPONSE: (),
+    SEND_BODY: (
+        IDLE,
+        SEND_RESPONSE,
+        SEND_BODY,
+        DONE,
+        MUST_CLOSE,
+        CLOSED,
+        ERROR,
+    ),
+    DONE: (
+        IDLE,
+        SEND_RESPONSE,
+        SEND_BODY,
+        DONE,
+        MUST_CLOSE,
+        CLOSED,
+        ERROR,
+    ),
+    MUST_CLOSE: (
+        IDLE,
+        SEND_RESPONSE,
+        SEND_BODY,
+        DONE,
+        MUST_CLOSE,
+        CLOSED,
+        ERROR,
+    ),
+    CLOSED: (
+        SEND_RESPONSE,
+        SEND_BODY,
+        DONE,
+        MUST_CLOSE,
+        CLOSED,
+        ERROR,
+    ),
+    MIGHT_SWITCH_PROTOCOL: (IDLE, SEND_RESPONSE, ERROR),
+    SWITCHED_PROTOCOL: (SWITCHED_PROTOCOL,),
+    ERROR: (IDLE, SEND_RESPONSE, SEND_BODY, DONE, MUST_CLOSE, CLOSED, ERROR),
+}
+
+
+def _snapshot_error(message: str) -> None:
+    raise ValueError(f"invalid connection state snapshot: {message}")
+
+
+def _require_mapping(value: Any, name: str) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _snapshot_error(f"{name} must be an object")
+    return dict(value)
+
+
+def _require_exact_keys(value: Mapping[str, Any], keys: Set[str], name: str) -> None:
+    actual = set(value)
+    missing = keys - actual
+    unknown = actual - keys
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append(f"missing {sorted(missing)}")
+        if unknown:
+            details.append(f"unknown {sorted(unknown)}")
+        _snapshot_error(f"{name} has invalid keys ({'; '.join(details)})")
+
+
+def _require_str(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        _snapshot_error(f"{name} must be a string")
+    return value
+
+
+def _require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        _snapshot_error(f"{name} must be a boolean")
+    return value
+
+
+def _require_int(value: Any, name: str, minimum: Optional[int] = None) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        _snapshot_error(f"{name} must be an integer")
+    if minimum is not None and value < minimum:
+        _snapshot_error(f"{name} must be >= {minimum}")
+    return value
+
+
+def _encode_bytes(value: Optional[bytes]) -> Optional[str]:
+    if value is None:
+        return None
+    return base64.b64encode(value).decode("ascii")
+
+
+def _snapshot_bytes(value: object) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    _snapshot_error("expected bytes")
+    raise AssertionError("unreachable")
+
+
+def _decode_bytes(value: Any, name: str, *, required: bool = False) -> Optional[bytes]:
+    if value is None:
+        if required:
+            _snapshot_error(f"{name} is required")
+        return None
+    text = _require_str(value, name)
+    try:
+        return base64.b64decode(text.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        _snapshot_error(f"{name} must be valid base64")
+        raise AssertionError("unreachable")
+
+
+def _lookup(value: Any, mapping: Mapping[str, Any], name: str) -> Any:
+    text = _require_str(value, name)
+    try:
+        return mapping[text]
+    except KeyError:
+        _snapshot_error(f"unknown {name} {text!r}")
+
+
+def _decode_body_snapshot(
+    value: Any,
+    name: str,
+    io_types: Mapping[str, type],
+) -> Optional[Tuple[type, Dict[str, Any]]]:
+    if value is None:
+        return None
+    snapshot = _require_mapping(value, name)
+    framing = _lookup(snapshot.get("framing"), io_types, f"{name}.framing")
+    return framing, snapshot
+
+
+def _build_body_io(
+    value: Any,
+    name: str,
+    io_types: Mapping[str, type],
+    *,
+    is_reader: bool,
+) -> Any:
+    decoded = _decode_body_snapshot(value, name, io_types)
+    if decoded is None:
+        return None
+    io_type, snapshot = decoded
+
+    if io_type is ContentLengthReader or io_type is ContentLengthWriter:
+        expected_keys = {"framing", "length", "remaining"} if is_reader else {
+            "framing",
+            "remaining",
+        }
+        _require_exact_keys(snapshot, expected_keys, name)
+        if is_reader:
+            length = _require_int(snapshot["length"], f"{name}.length", 0)
+            remaining = _require_int(snapshot["remaining"], f"{name}.remaining", 0)
+            if remaining > length:
+                _snapshot_error(f"{name}.remaining is greater than {name}.length")
+        else:
+            remaining = _require_int(snapshot["remaining"], f"{name}.remaining", 0)
+        return io_type._from_snapshot(snapshot)
+
+    if io_type is ChunkedReader:
+        _require_exact_keys(
+            snapshot,
+            {"framing", "bytes_in_chunk", "bytes_to_discard", "reading_trailer"},
+            name,
+        )
+        bytes_in_chunk = _require_int(
+            snapshot["bytes_in_chunk"], f"{name}.bytes_in_chunk", 0
+        )
+        bytes_to_discard = _decode_bytes(
+            snapshot["bytes_to_discard"], f"{name}.bytes_to_discard", required=True
+        )
+        reading_trailer = _require_bool(
+            snapshot["reading_trailer"], f"{name}.reading_trailer"
+        )
+        if bytes_to_discard not in (b"", b"\n", b"\r\n"):
+            _snapshot_error(f"{name}.bytes_to_discard is invalid")
+        if reading_trailer:
+            if bytes_in_chunk != 0 or bytes_to_discard:
+                _snapshot_error(f"{name} has an invalid trailer state")
+        snapshot["bytes_to_discard"] = bytes_to_discard
+        return io_type._from_snapshot(snapshot)
+
+    _require_exact_keys(snapshot, {"framing"}, name)
+    return io_type._from_snapshot(snapshot)
 
 
 # RFC 7230's rules for connection lifecycles:
@@ -231,6 +471,227 @@ class Connection:
     @property
     def they_are_waiting_for_100_continue(self) -> bool:
         return self.their_role is CLIENT and self.client_is_waiting_for_100_continue
+
+    def export_state(self) -> Dict[str, Any]:
+        """Export a versioned, JSON-compatible snapshot of this connection.
+
+        The snapshot contains parser state and buffered bytes, but no sockets
+        or user-owned event objects.
+        """
+        reader_state = (
+            cast(Any, self._reader)._snapshot()
+            if self.their_state is SEND_BODY
+            else None
+        )
+        if reader_state is not None and reader_state.get("framing") == "chunked":
+            reader_state = dict(reader_state)
+            reader_state["bytes_to_discard"] = _encode_bytes(
+                _snapshot_bytes(reader_state["bytes_to_discard"])
+            )
+        writer_state = (
+            cast(Any, self._writer)._snapshot()
+            if self.our_state is SEND_BODY
+            else None
+        )
+        return {
+            "version": STATE_FORMAT_VERSION,
+            "role": _ROLE_NAMES[self.our_role],
+            "max_incomplete_event_size": self._max_incomplete_event_size,
+            "states": {
+                "client": _STATE_NAMES[self._cstate.states[CLIENT]],
+                "server": _STATE_NAMES[self._cstate.states[SERVER]],
+            },
+            "keep_alive": self._cstate.keep_alive,
+            "pending_switch_proposals": [
+                _SWITCH_NAMES[proposal]
+                for proposal in self._cstate.pending_switch_proposals
+            ],
+            "their_http_version": _encode_bytes(self.their_http_version),
+            "request_method": _encode_bytes(self._request_method),
+            "client_is_waiting_for_100_continue": (
+                self.client_is_waiting_for_100_continue
+            ),
+            "receive_buffer": _encode_bytes(bytes(self._receive_buffer)),
+            "receive_buffer_closed": self._receive_buffer_closed,
+            "reader": reader_state,
+            "writer": writer_state,
+        }
+
+    @classmethod
+    def restore_state(cls, state: Mapping[str, Any]) -> "Connection":
+        """Create a connection from a snapshot returned by :meth:`export_state`."""
+        snapshot = _require_mapping(state, "state")
+        _require_exact_keys(
+            snapshot,
+            {
+                "version",
+                "role",
+                "max_incomplete_event_size",
+                "states",
+                "keep_alive",
+                "pending_switch_proposals",
+                "their_http_version",
+                "request_method",
+                "client_is_waiting_for_100_continue",
+                "receive_buffer",
+                "receive_buffer_closed",
+                "reader",
+                "writer",
+            },
+            "state",
+        )
+
+        version = snapshot["version"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            _snapshot_error("version must be an integer")
+        if version != STATE_FORMAT_VERSION:
+            _snapshot_error(
+                f"incompatible version {version} (expected {STATE_FORMAT_VERSION})"
+            )
+
+        our_role = _lookup(snapshot["role"], _ROLES_BY_NAME, "role")
+        their_role = SERVER if our_role is CLIENT else CLIENT
+        max_incomplete_event_size = _require_int(
+            snapshot["max_incomplete_event_size"],
+            "max_incomplete_event_size",
+            1,
+        )
+
+        raw_states = _require_mapping(snapshot["states"], "states")
+        _require_exact_keys(raw_states, {"client", "server"}, "states")
+        client_state = _lookup(raw_states["client"], _STATES_BY_NAME, "states.client")
+        server_state = _lookup(raw_states["server"], _STATES_BY_NAME, "states.server")
+        if client_state is SEND_RESPONSE:
+            _snapshot_error("clients cannot be in SEND_RESPONSE state")
+        if server_state is MIGHT_SWITCH_PROTOCOL:
+            _snapshot_error("servers cannot be in MIGHT_SWITCH_PROTOCOL state")
+        if server_state not in _COMPATIBLE_STATES[client_state]:
+            _snapshot_error("client and server states are incompatible")
+
+        keep_alive = _require_bool(snapshot["keep_alive"], "keep_alive")
+        raw_proposals = snapshot["pending_switch_proposals"]
+        if not isinstance(raw_proposals, list):
+            _snapshot_error("pending_switch_proposals must be a list")
+        pending_switch_proposals = {
+            _lookup(proposal, _SWITCHES_BY_NAME, "pending_switch_proposals")
+            for proposal in raw_proposals
+        }
+        if len(pending_switch_proposals) != len(raw_proposals):
+            _snapshot_error("pending_switch_proposals contains duplicates")
+        if pending_switch_proposals:
+            valid_proposal_states = (
+                client_state in (SEND_BODY, MIGHT_SWITCH_PROTOCOL)
+                and server_state in (IDLE, SEND_RESPONSE, ERROR)
+            ) or (
+                client_state,
+                server_state,
+            ) == (
+                SWITCHED_PROTOCOL,
+                SWITCHED_PROTOCOL,
+            ) or (
+                client_state is MIGHT_SWITCH_PROTOCOL and server_state is ERROR
+            )
+            if not valid_proposal_states:
+                _snapshot_error("pending switch proposals are invalid for the states")
+        elif (client_state, server_state) != (
+            SWITCHED_PROTOCOL,
+            SWITCHED_PROTOCOL,
+        ) and client_state is SWITCHED_PROTOCOL:
+            _snapshot_error("switched protocol state requires a switch proposal")
+
+        cstate = ConnectionState()
+        cstate.keep_alive = keep_alive
+        cstate.pending_switch_proposals = pending_switch_proposals
+        cstate.states = {CLIENT: client_state, SERVER: server_state}
+        stable_states = dict(cstate.states)
+        cstate._fire_state_triggered_transitions()
+        if cstate.states != stable_states:
+            _snapshot_error("state machine states are incompatible")
+
+        their_http_version = _decode_bytes(
+            snapshot["their_http_version"], "their_http_version"
+        )
+        request_method = _decode_bytes(snapshot["request_method"], "request_method")
+        if request_method is not None and not request_method:
+            _snapshot_error("request_method cannot be empty")
+
+        if (
+            client_state is SEND_BODY
+            or server_state in (SEND_RESPONSE, SEND_BODY)
+        ) and request_method is None:
+            _snapshot_error("request_method is required for the current state")
+
+        client_is_waiting = _require_bool(
+            snapshot["client_is_waiting_for_100_continue"],
+            "client_is_waiting_for_100_continue",
+        )
+        if client_is_waiting and client_state not in (
+            SEND_BODY,
+            DONE,
+            MUST_CLOSE,
+            MIGHT_SWITCH_PROTOCOL,
+            ERROR,
+        ):
+            _snapshot_error(
+                "client_is_waiting_for_100_continue is invalid for the current state"
+            )
+
+        receive_buffer = ReceiveBuffer()
+        buffered_data = _decode_bytes(
+            snapshot["receive_buffer"], "receive_buffer", required=True
+        )
+        assert buffered_data is not None
+        receive_buffer += buffered_data
+        receive_buffer_closed = _require_bool(
+            snapshot["receive_buffer_closed"], "receive_buffer_closed"
+        )
+
+        reader = _build_body_io(
+            snapshot["reader"],
+            "reader",
+            _READER_TYPES,
+            is_reader=True,
+        )
+        writer = _build_body_io(
+            snapshot["writer"],
+            "writer",
+            _WRITER_TYPES,
+            is_reader=False,
+        )
+        if cstate.states[their_role] is SEND_BODY:
+            if reader is None:
+                _snapshot_error("reader is required in SEND_BODY state")
+        elif reader is not None:
+            _snapshot_error("reader must be omitted outside SEND_BODY state")
+        if cstate.states[our_role] is SEND_BODY:
+            if writer is None:
+                _snapshot_error("writer is required in SEND_BODY state")
+        elif writer is not None:
+            _snapshot_error("writer must be omitted outside SEND_BODY state")
+
+        if reader is None:
+            reader = READERS.get((their_role, cstate.states[their_role]))
+        if writer is None:
+            writer = WRITERS.get((our_role, cstate.states[our_role]))
+
+        connection = cls.__new__(cls)
+        connection._max_incomplete_event_size = max_incomplete_event_size
+        connection.our_role = our_role
+        connection.their_role = their_role
+        connection._cstate = cstate
+        connection._writer = writer
+        connection._reader = reader
+        connection._receive_buffer = receive_buffer
+        connection._receive_buffer_closed = receive_buffer_closed
+        connection.their_http_version = their_http_version
+        connection._request_method = request_method
+        connection.client_is_waiting_for_100_continue = client_is_waiting
+        return connection
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> "Connection":
+        """Restore a connection from a snapshot returned by :meth:`export_state`."""
+        return cls.restore_state(state)
 
     def start_next_cycle(self) -> None:
         """Attempt to reset our connection state for a new request/response

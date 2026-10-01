@@ -1,3 +1,4 @@
+import json
 from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
 import pytest
@@ -7,6 +8,7 @@ from .._events import (
     ConnectionClosed,
     Data,
     EndOfMessage,
+    Event,
     InformationalResponse,
     Request,
     Response,
@@ -236,6 +238,390 @@ def test_chunk_boundaries() -> None:
 
     conn.receive_data(b"0\r\n\r\n")
     assert conn.next_event() == EndOfMessage()
+
+
+def _split_bytes(data: bytes) -> List[bytes]:
+    if not data:
+        return []
+    return [data[:2], data[2:5], data[5:]]
+
+
+def _collect_with_byte_chunks(conn: Connection, chunks: List[bytes]) -> List[Event]:
+    events = []
+    for chunk in chunks:
+        conn.receive_data(chunk)
+        events.extend(get_all_events(conn))
+    return events
+
+
+def _assert_restored_receive_matches(
+    original: Connection, prefix: bytes, following: bytes
+) -> None:
+    original.receive_data(prefix)
+    get_all_events(original)
+    state = json.loads(json.dumps(original.export_state()))
+
+    restored = Connection.restore_state(state)
+    restored_alias = Connection.from_state(state)
+    restored_without_more_data = Connection.restore_state(state)
+    assert restored_alias.states == original.states
+
+    chunks = _split_bytes(following)
+    original_following = _collect_with_byte_chunks(original, chunks)
+    restored_following = _collect_with_byte_chunks(restored, list(chunks))
+
+    assert restored_following == original_following
+    assert restored.states == original.states
+    assert restored.trailing_data == original.trailing_data
+    assert restored.their_http_version == original.their_http_version
+    assert restored._request_method == original._request_method
+    assert get_all_events(restored_without_more_data) == []
+
+
+def test_state_snapshot_half_request_header() -> None:
+    prefix = b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 6\r"
+    following = b"\n\r\nhello!"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_chunked_body_partial_chunk_header() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello\r\n3\r\nxy"
+    )
+    following = b"z\r\n0\r\n\r\n"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_chunked_body_mid_chunk() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhe"
+    )
+    following = b"llo\r\n0\r\n\r\n"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_chunked_body_pending_footer() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello"
+    )
+    following = b"\r\n0\r\n\r\n"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_chunked_body_partial_footer() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello\r"
+    )
+    following = b"\n0\r\n\r\n"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_content_length_body() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 5\r\n\r\nhe"
+    )
+    following = b"llo"
+    _assert_restored_receive_matches(Connection(SERVER), prefix, following)
+
+
+def test_state_snapshot_restores_receive_eof_during_body() -> None:
+    prefix = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 5\r\n\r\nhe"
+    )
+
+    original = Connection(SERVER)
+    original.receive_data(prefix)
+    assert get_all_events(original) == [
+        Request(
+            method="POST",
+            target="/",
+            headers=[("host", "example.com"), ("content-length", "5")],
+        ),
+        Data(data=b"he"),
+    ]
+    original.receive_data(b"")
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    with pytest.raises(RemoteProtocolError):
+        restored.next_event()
+    with pytest.raises(RemoteProtocolError):
+        original.next_event()
+    assert restored.states == original.states
+
+
+def test_state_snapshot_waiting_for_next_request() -> None:
+    first = (
+        b"GET /1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        b"GET /2 HTTP/1.1\r\nHost:"
+    )
+    following = b" example.com\r\n\r\n"
+    original = Connection(SERVER)
+    original.receive_data(first)
+    assert get_all_events(original) == [
+        Request(method="GET", target="/1", headers=[("host", "example.com")]),
+        EndOfMessage(),
+    ]
+    original.send(Response(status_code=204, headers=[]))
+    original.send(EndOfMessage())
+    original.start_next_cycle()
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.next_event() is NEED_DATA
+    assert _collect_with_byte_chunks(
+        restored, _split_bytes(following)
+    ) == _collect_with_byte_chunks(original, _split_bytes(following))
+    assert restored.states == original.states
+    assert restored.trailing_data == original.trailing_data
+
+
+def test_state_snapshot_done_waiting_for_next_cycle() -> None:
+    first = (
+        b"GET /1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        b"GET /2 HTTP/1.1\r\nHost: a"
+    )
+    following = b".com\r\n\r\n"
+    original = Connection(SERVER)
+    original.receive_data(first)
+    get_all_events(original)
+    original.send(Response(status_code=204, headers=[]))
+    original.send(EndOfMessage())
+    assert original.states == {CLIENT: DONE, SERVER: DONE}
+    assert original.next_event() is PAUSED
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.states == original.states
+    assert restored.next_event() is PAUSED
+    restored.start_next_cycle()
+    original.start_next_cycle()
+    assert _collect_with_byte_chunks(
+        restored, _split_bytes(following)
+    ) == _collect_with_byte_chunks(original, _split_bytes(following))
+
+
+def test_state_snapshot_100_continue_and_send_body() -> None:
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 5\r\n"
+        b"Expect: 100-continue\r\n\r\n"
+    )
+    original = Connection(SERVER)
+    original.receive_data(request)
+    assert get_all_events(original) == [
+        Request(
+            method="POST",
+            target="/",
+            headers=[
+                ("host", "example.com"),
+                ("content-length", "5"),
+                ("expect", "100-continue"),
+            ],
+        )
+    ]
+    assert original.they_are_waiting_for_100_continue
+
+    snapshot = json.loads(json.dumps(original.export_state()))
+    restored = Connection.restore_state(snapshot)
+    assert restored.they_are_waiting_for_100_continue
+
+    for conn in (original, restored):
+        assert conn.send(InformationalResponse(status_code=100, headers=[])) == (
+            b"HTTP/1.1 100 \r\n\r\n"
+        )
+        assert not conn.they_are_waiting_for_100_continue
+        assert conn.send(Response(status_code=200, headers=[("Content-Length", "2")]))
+        assert conn.send(Data(data=b"ok")) == b"ok"
+        assert conn.send(EndOfMessage()) == b""
+
+    chunks = _split_bytes(b"hello")
+    assert _collect_with_byte_chunks(
+        restored, list(chunks)
+    ) == _collect_with_byte_chunks(original, chunks)
+    assert restored.states == original.states
+
+
+def test_state_snapshot_client_waiting_for_100_continue() -> None:
+    original = Connection(CLIENT)
+    original.send(
+        Request(
+            method="POST",
+            target="/",
+            headers=[
+                ("Host", "example.com"),
+                ("Content-Length", "5"),
+                ("Expect", "100-continue"),
+            ],
+        )
+    )
+    assert original.client_is_waiting_for_100_continue
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.client_is_waiting_for_100_continue
+
+    continue_response = b"HTTP/1.1 100 Continue\r\n\r\n"
+    assert receive_and_get(restored, continue_response) == receive_and_get(
+        original, continue_response
+    )
+    assert restored.send(Data(data=b"hello")) == original.send(Data(data=b"hello"))
+    assert restored.states == original.states
+
+
+def test_state_snapshot_restores_content_length_writer() -> None:
+    original = Connection(SERVER)
+    original.receive_data(
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )
+    get_all_events(original)
+    original.send(Response(status_code=200, headers=[("Content-Length", "5")]))
+    assert original.send(Data(data=b"he")) == b"he"
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.send(Data(data=b"llo")) == b"llo"
+    assert restored.send(EndOfMessage()) == b""
+
+
+def test_state_snapshot_restores_send_error_state() -> None:
+    original = Connection(SERVER)
+    original.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    get_all_events(original)
+    with pytest.raises(LocalProtocolError):
+        original.send(Request(method="GET", target="/", headers=[("Host", "bad")]))
+    assert original.our_state is ERROR
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.our_state is ERROR
+    assert restored.states == original.states
+    with pytest.raises(LocalProtocolError):
+        restored.send(Response(status_code=200, headers=[]))
+
+
+def test_state_snapshot_preserves_remote_http_version() -> None:
+    original = Connection(CLIENT)
+    original.send(Request(method="GET", target="/", headers=[("Host", "example.com")]))
+    original.send(EndOfMessage())
+    original.receive_data(b"HTTP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+    assert get_all_events(original) == [
+        Response(
+            status_code=200,
+            reason="OK",
+            http_version="2.0",
+            headers=[("content-length", "0")],
+        ),
+        EndOfMessage(),
+    ]
+
+    restored = Connection.restore_state(
+        json.loads(json.dumps(original.export_state()))
+    )
+    assert restored.their_http_version == b"2.0"
+    assert restored.states == original.states
+
+
+def test_state_snapshot_rejects_invalid_data() -> None:
+    conn = Connection(SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    get_all_events(conn)
+    valid = conn.export_state()
+    assert json.loads(json.dumps(valid)) == valid
+
+    def rejects(mutated: Dict[str, Any]) -> None:
+        with pytest.raises(ValueError):
+            Connection.restore_state(mutated)
+
+    incompatible_version = dict(valid)
+    incompatible_version["version"] = 2
+    rejects(incompatible_version)
+
+    unknown_state = dict(valid)
+    unknown_state["states"] = {"client": "NOPE", "server": "DONE"}
+    rejects(unknown_state)
+
+    incompatible_states = dict(valid)
+    incompatible_states["states"] = {"client": "IDLE", "server": "SEND_BODY"}
+    rejects(incompatible_states)
+
+    bad_role = dict(valid)
+    bad_role["role"] = "proxy"
+    rejects(bad_role)
+
+    bad_length = json.loads(json.dumps(valid))
+    bad_length["max_incomplete_event_size"] = 0
+    rejects(bad_length)
+
+    unknown_key = dict(valid)
+    unknown_key["socket"] = object()
+    rejects(unknown_key)
+
+    bad_base64 = json.loads(json.dumps(valid))
+    bad_base64["receive_buffer"] = "not base64!"
+    rejects(bad_base64)
+
+    body_conn = Connection(SERVER)
+    body_conn.receive_data(
+        b"POST /body HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 5\r\n\r\nab"
+    )
+    get_all_events(body_conn)
+    body_snapshot = json.loads(json.dumps(body_conn.export_state()))
+    bad_remaining = dict(body_snapshot)
+    bad_remaining["reader"] = dict(body_snapshot["reader"], length=1, remaining=2)
+    rejects(bad_remaining)
+
+    negative_length = dict(body_snapshot)
+    negative_length["reader"] = {
+        "framing": "content-length",
+        "length": -1,
+        "remaining": -1,
+    }
+    rejects(negative_length)
+
+    bad_framing = dict(body_snapshot)
+    bad_framing["reader"] = {"framing": "bogus"}
+    rejects(bad_framing)
+
+    missing_framing = dict(body_snapshot)
+    missing_framing["reader"] = None
+    rejects(missing_framing)
+
+    writer_conn = Connection(SERVER)
+    writer_conn.receive_data(
+        b"GET /write HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )
+    get_all_events(writer_conn)
+    writer_conn.send(Response(status_code=200, headers=[("Content-Length", "3")]))
+    writer_snapshot = json.loads(json.dumps(writer_conn.export_state()))
+    negative_writer_remaining = dict(writer_snapshot)
+    negative_writer_remaining["writer"] = {"framing": "content-length", "remaining": -1}
+    rejects(negative_writer_remaining)
 
 
 def test_client_talking_to_http10_server() -> None:

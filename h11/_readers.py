@@ -17,7 +17,18 @@
 # - or, for body readers, a dict of per-framing reader factories
 
 import re
-from typing import Any, Callable, Dict, Iterable, NoReturn, Optional, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    Iterable,
+    NoReturn,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 from ._abnf import chunk_header, header_field, request_line, status_line
 from ._events import Data, EndOfMessage, InformationalResponse, Request, Response
@@ -124,6 +135,19 @@ class ContentLengthReader:
         self._length = length
         self._remaining = length
 
+    def _snapshot(self) -> Dict[str, object]:
+        return {
+            "framing": "content-length",
+            "length": self._length,
+            "remaining": self._remaining,
+        }
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "ContentLengthReader":
+        reader = cls(int(snapshot["length"]))
+        reader._remaining = int(snapshot["remaining"])
+        return reader
+
     def __call__(self, buf: ReceiveBuffer) -> Union[Data, EndOfMessage, None]:
         if self._remaining == 0:
             return EndOfMessage()
@@ -209,6 +233,22 @@ class ChunkedReader:
             "(incomplete chunked read)"
         )
 
+    def _snapshot(self) -> Dict[str, object]:
+        return {
+            "framing": "chunked",
+            "bytes_in_chunk": self._bytes_in_chunk,
+            "bytes_to_discard": self._bytes_to_discard,
+            "reading_trailer": self._reading_trailer,
+        }
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "ChunkedReader":
+        reader = cls()
+        reader._bytes_in_chunk = int(snapshot["bytes_in_chunk"])
+        reader._bytes_to_discard = cast(bytes, snapshot["bytes_to_discard"])
+        reader._reading_trailer = bool(snapshot["reading_trailer"])
+        return reader
+
 
 class Http10Reader:
     def __call__(self, buf: ReceiveBuffer) -> Optional[Data]:
@@ -219,6 +259,13 @@ class Http10Reader:
 
     def read_eof(self) -> EndOfMessage:
         return EndOfMessage()
+
+    def _snapshot(self) -> Dict[str, object]:
+        return {"framing": "http/1.0"}
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "Http10Reader":
+        return cls()
 
 
 def expect_nothing(buf: ReceiveBuffer) -> None:

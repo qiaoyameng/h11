@@ -97,6 +97,15 @@ class ContentLengthWriter(BodyWriter):
         if headers:
             raise LocalProtocolError("Content-Length and trailers don't mix")
 
+    def _snapshot(self) -> Dict[str, object]:
+        return {"framing": "content-length", "remaining": self._length}
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "ContentLengthWriter":
+        writer = cls.__new__(cls)
+        writer._length = int(snapshot["remaining"])
+        return writer
+
 
 class ChunkedWriter(BodyWriter):
     def send_data(self, data: bytes, write: Writer) -> None:
@@ -112,6 +121,13 @@ class ChunkedWriter(BodyWriter):
         write(b"0\r\n")
         write_headers(headers, write)
 
+    def _snapshot(self) -> Dict[str, object]:
+        return {"framing": "chunked"}
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "ChunkedWriter":
+        return cls()
+
 
 class Http10Writer(BodyWriter):
     def send_data(self, data: bytes, write: Writer) -> None:
@@ -122,6 +138,13 @@ class Http10Writer(BodyWriter):
             raise LocalProtocolError("can't send trailers to HTTP/1.0 client")
         # no need to close the socket ourselves, that will be taken care of by
         # Connection: close machinery
+
+    def _snapshot(self) -> Dict[str, object]:
+        return {"framing": "http/1.0"}
+
+    @classmethod
+    def _from_snapshot(cls, snapshot: Dict[str, object]) -> "Http10Writer":
+        return cls()
 
 
 WritersType = Dict[
