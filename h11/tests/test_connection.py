@@ -1103,6 +1103,14 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
         c.next_event()
     assert "received 5 bytes" in str(excinfo.value)
     assert "expected 100" in str(excinfo.value)
+    assert excinfo.value.error_location.fragment_category == "content-length-body"
+    assert (
+        excinfo.value.error_location.connection_offset
+        == c._receive_buffer.consumed_offset
+    )
+    assert excinfo.value.error_location.message_offset == (
+        c._receive_buffer.consumed_offset - c._receive_buffer.message_start_offset
+    )
 
     c = Connection(SERVER)
     c.receive_data(
@@ -1118,3 +1126,172 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
     with pytest.raises(RemoteProtocolError) as excinfo:
         c.next_event()
     assert "incomplete chunked read" in str(excinfo.value)
+    assert excinfo.value.error_location.fragment_category == "chunked-body"
+    assert (
+        excinfo.value.error_location.connection_offset
+        == c._receive_buffer.consumed_offset
+    )
+    assert excinfo.value.error_location.message_offset == (
+        c._receive_buffer.consumed_offset - c._receive_buffer.message_start_offset
+    )
+
+
+@pytest.mark.parametrize(
+    ("sample", "fragment_category", "message_offset", "fragment_length"),
+    [
+        (
+            b"GET /bad target HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "request-line",
+            0,
+            len(b"GET /bad target HTTP/1.1"),
+        ),
+        (
+            b"GET / HTTP/1.1\r\n  folded: bad\r\nHost: example.com\r\n\r\n",
+            "header",
+            len(b"GET / HTTP/1.1\r\n"),
+            len(b"  folded: bad"),
+        ),
+        (
+            b"POST / HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Content-Length: 1\r\n"
+            b"Content-Length: 2\r\n\r\n",
+            "content-length",
+            len(
+                b"POST / HTTP/1.1\r\n"
+                b"Host: example.com\r\n"
+                b"Content-Length: 1\r\n"
+            ),
+            len(b"Content-Length: 2"),
+        ),
+        (
+            b"POST / HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"ZZZ\r\n",
+            "chunk-size",
+            len(
+                b"POST / HTTP/1.1\r\n"
+                b"Host: example.com\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+            ),
+            len(b"ZZZ"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("keep_alive", [False, True])
+def test_remote_error_locations_are_stable_across_input_chunks(
+    sample: bytes,
+    fragment_category: str,
+    message_offset: int,
+    fragment_length: int,
+    keep_alive: bool,
+) -> None:
+    previous_request = b"GET /previous HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    cut_sets: List[List[int]] = [
+        [len(sample)],
+        [1, 5, 20, len(sample)],
+        list(range(1, len(sample) + 1)),
+    ]
+
+    def run(cuts: List[int]) -> Tuple[RemoteProtocolError, int]:
+        c = Connection(SERVER)
+        connection_offset = 0
+        if keep_alive:
+            c.receive_data(previous_request)
+            assert type(c.next_event()) is Request
+            assert type(c.next_event()) is EndOfMessage
+            c.send(Response(status_code=204, headers=[]))
+            c.send(EndOfMessage())
+            c.start_next_cycle()
+            connection_offset = len(previous_request)
+
+        start = 0
+        for end in cuts:
+            c.receive_data(sample[start:end])
+            start = end
+            try:
+                while True:
+                    event = c.next_event()
+                    if event in (NEED_DATA, PAUSED):
+                        break
+            except RemoteProtocolError as exc:
+                return exc, connection_offset
+
+        raise AssertionError("expected RemoteProtocolError")
+
+    results = [run(cuts) for cuts in cut_sets]
+    locations = [exc.error_location for exc, _ in results]
+
+    assert locations is not None
+    assert len({location for location in locations}) == 1
+    location = locations[0]
+    exc = results[0][0]
+    connection_offset = results[0][1]
+    assert location.connection_offset == connection_offset + message_offset
+    assert location.connection_end_offset == (
+        connection_offset + message_offset + fragment_length
+    )
+    assert location.message_offset == message_offset
+    assert location.message_end_offset == message_offset + fragment_length
+    assert location.fragment_category == fragment_category
+    assert exc.connection_end_offset == (
+        connection_offset + message_offset + fragment_length
+    )
+    assert exc.message_end_offset == message_offset + fragment_length
+
+
+def test_remote_error_location_survives_compaction_and_cross_input_error() -> None:
+    first_message = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        b"9\r\ntopsecret\r\n"
+        b"0\r\n\r\n"
+    )
+    sample = b"POST /bad target HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    c = Connection(SERVER)
+
+    c.receive_data(first_message)
+    assert type(c.next_event()) is Request
+    assert c.next_event() == Data(
+        data=b"topsecret", chunk_start=True, chunk_end=True
+    )
+    assert type(c.next_event()) is EndOfMessage
+    c.send(Response(status_code=204, headers=[]))
+    c.send(EndOfMessage())
+    c.start_next_cycle()
+    assert not c._receive_buffer
+    assert c._receive_buffer.consumed_offset == len(first_message)
+
+    c.receive_data(sample[:10])
+    assert c.next_event() is NEED_DATA
+    c.receive_data(sample[10:])
+    assert c._receive_buffer.consumed_offset == len(first_message)
+
+    with pytest.raises(RemoteProtocolError) as excinfo:
+        c.next_event()
+
+    location = excinfo.value.error_location
+    assert location.connection_offset == len(first_message)
+    assert location.message_offset == 0
+    assert location.fragment_category == "request-line"
+    assert location.connection_end_offset == len(first_message) + 25
+    assert b"topsecret" not in repr(excinfo.value).encode("ascii", "ignore")
+
+
+def test_bad_content_length_value_points_to_header() -> None:
+    c = Connection(SERVER)
+    c.receive_data(
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: x\r\n\r\n"
+    )
+
+    with pytest.raises(RemoteProtocolError) as excinfo:
+        c.next_event()
+
+    location = excinfo.value.error_location
+    assert location.connection_offset == 36
+    assert location.message_offset == 36
+    assert location.connection_end_offset == 53
+    assert location.message_end_offset == 53
+    assert location.fragment_category == "content-length"

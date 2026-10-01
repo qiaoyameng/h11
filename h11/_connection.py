@@ -428,7 +428,7 @@ class Connection:
                 # return that event, and then the state will change and we'll
                 # get called again to generate the actual ConnectionClosed().
                 if hasattr(self._reader, "read_eof"):
-                    event = self._reader.read_eof()
+                    event = self._reader.read_eof(self._receive_buffer)
                 else:
                     event = ConnectionClosed()
         if event is None:
@@ -480,18 +480,38 @@ class Connection:
         try:
             event = self._extract_next_receive_event()
             if event not in [NEED_DATA, PAUSED]:
-                self._process_event(self.their_role, cast(Event, event))
+                event = cast(Event, event)
+                self._process_event(self.their_role, event)
+                if type(event) is EndOfMessage:
+                    self._receive_buffer.end_message()
             if event is NEED_DATA:
                 if len(self._receive_buffer) > self._max_incomplete_event_size:
                     # 431 is "Request header fields too large" which is pretty
                     # much the only situation where we can get here
+                    fragment_category = (
+                        "chunk-size" if self.their_state is SEND_BODY else "headers"
+                    )
                     raise RemoteProtocolError(
-                        "Receive buffer too long", error_status_hint=431
+                        "Receive buffer too long",
+                        error_status_hint=431,
+                        error_location=self._receive_buffer.make_error_location(
+                            fragment_category
+                        ),
                     )
                 if self._receive_buffer_closed:
                     # We're still trying to complete some event, but that's
                     # never going to happen because no more data is coming
-                    raise RemoteProtocolError("peer unexpectedly closed connection")
+                    fragment_category = (
+                        "chunked-body"
+                        if self.their_state is SEND_BODY
+                        else "headers"
+                    )
+                    raise RemoteProtocolError(
+                        "peer unexpectedly closed connection",
+                        error_location=self._receive_buffer.make_error_location(
+                            fragment_category
+                        ),
+                    )
             return event
         except BaseException as exc:
             self._process_error(self.their_role)

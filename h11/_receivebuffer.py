@@ -1,6 +1,7 @@
 import re
-import sys
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
+
+from ._util import ErrorLocation
 
 __all__ = ["ReceiveBuffer"]
 
@@ -49,6 +50,8 @@ class ReceiveBuffer:
         self._data = bytearray()
         self._next_line_search = 0
         self._multiple_lines_search = 0
+        self._consumed_offset = 0
+        self._message_start_offset = 0
 
     def __iadd__(self, byteslike: Union[bytes, bytearray]) -> "ReceiveBuffer":
         self._data += byteslike
@@ -60,6 +63,38 @@ class ReceiveBuffer:
     def __len__(self) -> int:
         return len(self._data)
 
+    @property
+    def consumed_offset(self) -> int:
+        return self._consumed_offset
+
+    @property
+    def message_start_offset(self) -> int:
+        return self._message_start_offset
+
+    def begin_message(self) -> None:
+        self._message_start_offset = self._consumed_offset
+
+    def end_message(self) -> None:
+        self._message_start_offset = self._consumed_offset
+
+    def make_error_location(
+        self,
+        fragment_category: str,
+        start: int = 0,
+        end: Optional[int] = None,
+    ) -> ErrorLocation:
+        if end is None:
+            end = len(self._data)
+        connection_start = self._consumed_offset + start
+        connection_end = self._consumed_offset + end
+        return ErrorLocation(
+            connection_offset=connection_start,
+            connection_end_offset=connection_end,
+            message_offset=connection_start - self._message_start_offset,
+            message_end_offset=connection_end - self._message_start_offset,
+            fragment_category=fragment_category,
+        )
+
     # for @property unprocessed_data
     def __bytes__(self) -> bytes:
         return bytes(self._data)
@@ -68,6 +103,7 @@ class ReceiveBuffer:
         # extracting an initial slice of the data buffer and return it
         out = self._data[:count]
         del self._data[:count]
+        self._consumed_offset += count
 
         self._next_line_search = 0
         self._multiple_lines_search = 0
@@ -101,18 +137,52 @@ class ReceiveBuffer:
 
         return self._extract(idx)
 
-    def maybe_extract_lines(self) -> Optional[List[bytearray]]:
+    def maybe_extract_next_line_with_offset(
+        self,
+    ) -> Optional[Tuple[bytearray, int]]:
+        line = self.maybe_extract_next_line()
+        if line is None:
+            return None
+        return line, self._consumed_offset - len(line)
+
+    def _lines_with_offsets(self, out: bytearray) -> List[Tuple[bytearray, int]]:
+        lines: List[Tuple[bytearray, int]] = []
+        line_start = self._consumed_offset - len(out)
+        line = bytearray()
+        i = 0
+        while i < len(out):
+            byte = out[i]
+            if byte == 0x0A:
+                if line.endswith(b"\r"):
+                    del line[-1]
+                lines.append((line, line_start))
+                line = bytearray()
+                line_start = self._consumed_offset - len(out) + i + 1
+            else:
+                line.append(byte)
+            i += 1
+        if out and out[-1] == 0x0A:
+            lines.append((bytearray(), line_start))
+        if line:
+            lines.append((line, line_start))
+        return lines
+
+    def maybe_extract_lines_with_offsets(
+        self,
+    ) -> Optional[Tuple[List[Tuple[bytearray, int]], int, int]]:
         """
         Extract everything up to the first blank line, and return a list of lines.
         """
+        start = self._consumed_offset
+
         # Handle the case where we have an immediate empty line.
         if self._data[:1] == b"\n":
             self._extract(1)
-            return []
+            return [], start, self._consumed_offset
 
         if self._data[:2] == b"\r\n":
             self._extract(2)
-            return []
+            return [], start, self._consumed_offset
 
         # Only search in buffer space that we've not already looked at.
         match = blank_line_regex.search(self._data, self._multiple_lines_search)
@@ -123,17 +193,20 @@ class ReceiveBuffer:
         # Truncate the buffer and return it.
         idx = match.span(0)[-1]
         out = self._extract(idx)
-        lines = out.split(b"\n")
+        lines_with_offsets = self._lines_with_offsets(out)
 
-        for line in lines:
-            if line.endswith(b"\r"):
-                del line[-1]
+        assert lines_with_offsets[-2][0] == lines_with_offsets[-1][0] == b""
 
-        assert lines[-2] == lines[-1] == b""
+        del lines_with_offsets[-2:]
 
-        del lines[-2:]
+        return lines_with_offsets, start, self._consumed_offset
 
-        return lines
+    def maybe_extract_lines(self) -> Optional[List[bytearray]]:
+        result = self.maybe_extract_lines_with_offsets()
+        if result is None:
+            return None
+        lines, _, _ = result
+        return [line for line, _ in lines]
 
     # In theory we should wait until `\r\n` before starting to validate
     # incoming data. However it's interesting to detect (very) invalid data

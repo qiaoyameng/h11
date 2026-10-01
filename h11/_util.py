@@ -1,12 +1,25 @@
-from typing import Any, Dict, NoReturn, Pattern, Tuple, Type, TypeVar, Union
+from dataclasses import dataclass
+from typing import Any, Dict, NoReturn, Optional, Pattern, Tuple, Type, TypeVar, Union
 
 __all__ = [
     "ProtocolError",
     "LocalProtocolError",
     "RemoteProtocolError",
+    "ErrorLocation",
     "validate",
     "bytesify",
 ]
+
+
+@dataclass(frozen=True)
+class ErrorLocation:
+    """The location of the bytes that caused a protocol error."""
+
+    connection_offset: int
+    message_offset: int
+    fragment_category: str
+    connection_end_offset: int
+    message_end_offset: int
 
 
 class ProtocolError(Exception):
@@ -18,7 +31,8 @@ class ProtocolError(Exception):
     indicates that the remote peer tried to do something that HTTP/1.1 says is
     illegal. See :ref:`error-handling` for details.
 
-    In addition to the normal :exc:`Exception` features, it has one attribute:
+    In addition to the normal :exc:`Exception` features, it has these
+    attributes:
 
     .. attribute:: error_status_hint
 
@@ -36,13 +50,58 @@ class ProtocolError(Exception):
        The default is 400 Bad Request, a generic catch-all for protocol
        violations.
 
+    .. attribute:: error_location
+
+       For errors detected while receiving remote data, an
+       :class:`ErrorLocation` describing the offending byte range. It contains
+       the start of the range as ``connection_offset`` and ``message_offset``
+       (relative to the start of the current request or response), plus
+       ``fragment_category``. The matching ``connection_end_offset`` and
+       ``message_end_offset`` fields give the exclusive end of the range.
+
     """
 
-    def __init__(self, msg: str, error_status_hint: int = 400) -> None:
+    def __init__(
+        self,
+        msg: str,
+        error_status_hint: int = 400,
+        error_location: Optional[ErrorLocation] = None,
+    ) -> None:
         if type(self) is ProtocolError:
             raise TypeError("tried to directly instantiate ProtocolError")
         Exception.__init__(self, msg)
         self.error_status_hint = error_status_hint
+        self.error_location = error_location
+
+    @property
+    def connection_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.connection_offset
+
+    @property
+    def message_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.message_offset
+
+    @property
+    def fragment_category(self) -> Optional[str]:
+        if self.error_location is None:
+            return None
+        return self.error_location.fragment_category
+
+    @property
+    def connection_end_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.connection_end_offset
+
+    @property
+    def message_end_offset(self) -> Optional[int]:
+        if self.error_location is None:
+            return None
+        return self.error_location.message_end_offset
 
 
 # Strategy: there are a number of public APIs where a LocalProtocolError can

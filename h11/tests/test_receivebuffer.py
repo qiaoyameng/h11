@@ -133,3 +133,45 @@ def test_receivebuffer_for_invalid_delimiter(data: Tuple[bytes]) -> None:
         b"Connection: close",
     ]
     assert bytes(b) == b"Some body"
+
+
+def test_extracted_line_offsets_survive_compaction() -> None:
+    b = ReceiveBuffer()
+    b += b"first\r\nsecond\r\n"
+
+    assert b.maybe_extract_next_line_with_offset() == (b"first\r\n", 0)
+    assert b.consumed_offset == 7
+    assert b.maybe_extract_next_line_with_offset() == (b"second\r\n", 7)
+    assert b.consumed_offset == 15
+    assert not b
+
+
+def test_header_line_offsets_for_lf_and_crlf() -> None:
+    for separator in (b"\r\n", b"\n"):
+        b = ReceiveBuffer()
+        b += (
+            b"GET / HTTP/1.1"
+            + separator
+            + b"Host: example.com"
+            + separator
+            + separator
+        )
+
+        lines, start, end = b.maybe_extract_lines_with_offsets()
+        total_length = len(
+            b"GET / HTTP/1.1"
+            + separator
+            + b"Host: example.com"
+            + separator
+            + separator
+        )
+
+        assert start == 0
+        assert end == total_length
+        assert lines == [
+            (bytearray(b"GET / HTTP/1.1"), 0),
+            (
+                bytearray(b"Host: example.com"),
+                len(b"GET / HTTP/1.1" + separator),
+            ),
+        ]
