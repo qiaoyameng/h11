@@ -116,11 +116,32 @@ HEXDIG = r"[0-9A-Fa-f]"
 #
 # but we impose an upper-limit to avoid ridiculosity. len(str(2**64)) == 20
 chunk_size = r"({HEXDIG}){{1,20}}".format(**globals())
-# Actually
+
+# https://www.rfc-editor.org/rfc/rfc7230#section-3.2.6
 #
-#     chunk-ext      = *( ";" chunk-ext-name [ "=" chunk-ext-val ] )
+#   quoted-string  = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+#   qdtext         = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+#   quoted-pair    = "\" ( HTAB / SP / VCHAR / obs-text )
+qdtext = r"[\t\x20\x21\x23-\x5b\x5d-\x7e\x80-\xff]"
+quoted_pair = r"\\[\t\x20-\x7e\x80-\xff]"
+quoted_string = r'"(?:{qdtext}|{quoted_pair})*"'.format(**globals())
+
+# https://www.rfc-editor.org/rfc/rfc7230#section-4.1.1
 #
-# but we aren't parsing the things so we don't really care.
+#   chunk-ext      = *( ";" chunk-ext-name [ "=" chunk-ext-val ] )
+#   chunk-ext-name = token
+#   chunk-ext-val  = token / quoted-string
+#
+# chunk_ext_part matches a single ";" name [= value] element, and is used to
+# actually parse the extensions when preserve_chunk_extensions is enabled.
+chunk_ext_name = token
+chunk_ext_val = r"(?:{token}|{quoted_string})".format(**globals())
+chunk_ext_part = (
+    r";(?P<ext_name>{chunk_ext_name})"
+    r"(?:=(?P<ext_val>{chunk_ext_val}))?"
+).format(**globals())
+# When not parsing chunk extensions, we accept (and discard) anything after
+# the chunk-size, like we always have.
 chunk_ext = r";.*"
 chunk_header = (
     r"(?P<chunk_size>{chunk_size})"

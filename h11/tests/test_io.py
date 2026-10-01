@@ -473,6 +473,212 @@ def test_ChunkedReader() -> None:
     t_body_reader(ChunkedReader, b"3\r\nxxx_\n1a\r\n", [LocalProtocolError])
 
 
+def _read_all_events(
+    reader: Any, data: bytes, byte_by_byte: bool = False
+) -> List[Event]:
+    buf = ReceiveBuffer()
+    events: List[Event] = []
+
+    def drain() -> None:
+        while True:
+            event = reader(buf)
+            if event is None:
+                break
+            events.append(event)
+
+    if byte_by_byte:
+        for i in range(len(data)):
+            buf += data[i : i + 1]
+            drain()
+    else:
+        buf += data
+        drain()
+    assert not buf
+    return events
+
+
+def test_ChunkedReader_chunk_extensions() -> None:
+    def make_reader() -> ChunkedReader:
+        return ChunkedReader(preserve_chunk_extensions=True)
+
+    body = (
+        b'5;sig=abc123;flag;sig="quoted \\"value\\""\r\n'
+        b"hello\r\n"
+        b'A;empty="";sig=x\r\n'
+        b"0123456789\r\n"
+        b'0;final="end sig"\r\n'
+        b"X-Trailer: yes\r\n"
+        b"\r\n"
+    )
+    expected_first = Data(
+        data=b"hello",
+        chunk_start=True,
+        chunk_end=True,
+        chunk_extensions=[
+            (b"sig", b"abc123"),
+            (b"flag", b""),
+            (b"sig", b'quoted "value"'),
+        ],
+    )
+    expected_second = Data(
+        data=b"0123456789",
+        chunk_start=True,
+        chunk_end=True,
+        chunk_extensions=[(b"empty", b""), (b"sig", b"x")],
+    )
+    expected_eom = EndOfMessage(
+        headers=[("X-Trailer", "yes")],
+        chunk_extensions=[(b"final", b"end sig")],
+    )
+    expected = [expected_first, expected_second, expected_eom]
+    assert _read_all_events(make_reader(), body) == expected
+
+    # Feeding one byte at a time splits chunks into multiple Data events;
+    # the extensions must still show up exactly once, on the chunk_start
+    # event of the chunk they belong to.
+    events = _read_all_events(make_reader(), body, byte_by_byte=True)
+    data_events = [event for event in events if type(event) is Data]
+    assert b"".join(event.data for event in data_events) == b"hello0123456789"
+    start_events = [event for event in data_events if event.chunk_start]
+    assert [event.chunk_extensions for event in start_events] == [
+        expected_first.chunk_extensions,
+        expected_second.chunk_extensions,
+    ]
+    for event in data_events:
+        if not event.chunk_start:
+            assert event.chunk_extensions == ()
+    # Extensions on the final zero-length chunk are not lost
+    assert events[-1] == expected_eom
+
+    # No extensions -> empty tuple, same as before
+    assert _read_all_events(make_reader(), b"5\r\nhello\r\n0\r\n\r\n") == [
+        Data(data=b"hello", chunk_start=True, chunk_end=True),
+        EndOfMessage(),
+    ]
+
+    # Trailing whitespace after the extensions is tolerated, like the
+    # existing lenient handling of whitespace after the chunk-size.
+    assert _read_all_events(make_reader(), b"5;sig=x \t\r\nhello\r\n0\r\n\r\n") == [
+        Data(
+            data=b"hello",
+            chunk_start=True,
+            chunk_end=True,
+            chunk_extensions=[(b"sig", b"x")],
+        ),
+        EndOfMessage(),
+    ]
+
+
+def test_ChunkedReader_chunk_extensions_errors() -> None:
+    # Malformed extensions are rejected when preserving...
+    for bad_ext in [b"; =x", b";foo=", b';unclosed="x', b";\x00", b";a==1"]:
+        t_body_reader(
+            lambda: ChunkedReader(preserve_chunk_extensions=True),
+            b"5" + bad_ext + b"\r\nxxxxx\r\n0\r\n\r\n",
+            [LocalProtocolError],
+        )
+    # ...but accepted and discarded in the default mode, as before
+    for bad_ext in [b"; =x", b";foo=", b';unclosed="x', b";\x00", b";a==1"]:
+        t_body_reader(
+            ChunkedReader,
+            b"5" + bad_ext + b"\r\nxxxxx\r\n0\r\n\r\n",
+            [Data(data=b"xxxxx"), EndOfMessage()],
+        )
+
+
+def test_ChunkedWriter_chunk_extensions() -> None:
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    # token values are sent bare
+    assert (
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"sig", b"abc123")]))
+        == b"3;sig=abc123\r\naaa\r\n"
+    )
+    # repeated names keep their order
+    assert (
+        dowrite(
+            w, Data(data=b"aaa", chunk_extensions=[(b"sig", b"1"), (b"sig", b"2")])
+        )
+        == b"3;sig=1;sig=2\r\naaa\r\n"
+    )
+    # empty values are sent without "="
+    assert (
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"flag", b"")]))
+        == b"3;flag\r\naaa\r\n"
+    )
+    # non-token values are quoted, with " and \ escaped
+    assert (
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"sig", b'a "b" \\ c')]))
+        == b'3;sig="a \\"b\\" \\\\ c"\r\naaa\r\n'
+    )
+    # extensions on the final zero-length chunk
+    assert (
+        dowrite(w, EndOfMessage(chunk_extensions=[(b"sig", b"end sig")]))
+        == b'0;sig="end sig"\r\n\r\n'
+    )
+    # newline injection is forbidden, in both names and values
+    for bad in (b"\r", b"\n", b"\r\n"):
+        with pytest.raises(LocalProtocolError):
+            dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"sig", b"x" + bad)]))
+        with pytest.raises(LocalProtocolError):
+            dowrite(w, EndOfMessage(chunk_extensions=[(b"sig", b"x" + bad)]))
+    with pytest.raises(LocalProtocolError):
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"bad\r\nname", b"x")]))
+    # other control characters are rejected too
+    with pytest.raises(LocalProtocolError):
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"sig", b"x\x00y")]))
+    # illegal names are rejected
+    with pytest.raises(LocalProtocolError):
+        dowrite(w, Data(data=b"aaa", chunk_extensions=[(b"bad name", b"x")]))
+    # extensions on an empty Data event would be silently lost
+    with pytest.raises(LocalProtocolError):
+        dowrite(w, Data(data=b"", chunk_extensions=[(b"sig", b"x")]))
+
+    # Without preserve_chunk_extensions, extensions may not be sent...
+    w_off = ChunkedWriter()
+    with pytest.raises(LocalProtocolError):
+        dowrite(w_off, Data(data=b"aaa", chunk_extensions=[(b"sig", b"x")]))
+    with pytest.raises(LocalProtocolError):
+        dowrite(w_off, EndOfMessage(chunk_extensions=[(b"sig", b"x")]))
+    # ...but plain Data events work exactly as before
+    assert dowrite(w_off, Data(data=b"aaa")) == b"3\r\naaa\r\n"
+    assert dowrite(w_off, EndOfMessage()) == b"0\r\n\r\n"
+
+
+def test_chunk_extensions_roundtrip() -> None:
+    # Everything the reader parses can be re-encoded by the writer,
+    # byte-for-byte.
+    raw = (
+        b'8;sig=deadbeef;sig="a b\\"c"\r\n'
+        b"chunkone"
+        b"\r\n"
+        b"4;flag\r\n"
+        b"two!"
+        b"\r\n"
+        b'0;final="end sig"\r\n'
+        b"X-Trailer: yes\r\n"
+        b"\r\n"
+    )
+    events = _read_all_events(
+        ChunkedReader(preserve_chunk_extensions=True), raw, byte_by_byte=True
+    )
+    writer = ChunkedWriter(preserve_chunk_extensions=True)
+    out = b""
+    # Merge each chunk's Data events back together before re-sending.
+    merged_events: List[Event] = []
+    for event in events:
+        last = merged_events[-1] if merged_events else None
+        if type(event) is Data and not event.chunk_start and type(last) is Data:
+            merged_events[-1] = Data(
+                data=last.data + event.data,
+                chunk_extensions=last.chunk_extensions,
+            )
+        else:
+            merged_events.append(event)
+    for event in merged_events:
+        out += dowrite(writer, event)
+    assert out == raw
+
+
 def test_ContentLengthWriter() -> None:
     w = ContentLengthWriter(5)
     assert dowrite(w, Data(data=b"123")) == b"123"

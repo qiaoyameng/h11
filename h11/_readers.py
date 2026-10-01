@@ -17,9 +17,26 @@
 # - or, for body readers, a dict of per-framing reader factories
 
 import re
-from typing import Any, Callable, Dict, Iterable, NoReturn, Optional, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NoReturn,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
-from ._abnf import chunk_header, header_field, request_line, status_line
+from ._abnf import (
+    chunk_ext_part,
+    chunk_header,
+    header_field,
+    request_line,
+    status_line,
+)
 from ._events import Data, EndOfMessage, InformationalResponse, Request, Response
 from ._receivebuffer import ReceiveBuffer
 from ._state import (
@@ -144,21 +161,67 @@ class ContentLengthReader:
 
 chunk_header_re = re.compile(chunk_header.encode("ascii"))
 
+chunk_ext_part_re = re.compile(chunk_ext_part.encode("ascii"))
+
+
+def _unquote_chunk_ext_value(value: bytes) -> bytes:
+    # 'value' is the interior of a quoted-string, already validated against
+    # the quoted-string grammar, so every "\" is a valid quoted-pair.
+    out = bytearray()
+    pos = 0
+    while pos < len(value):
+        if value[pos] == 0x5C:  # "\"
+            pos += 1
+        out.append(value[pos])
+        pos += 1
+    return bytes(out)
+
+
+def _parse_chunk_extensions(data: bytes) -> List[Tuple[bytes, bytes]]:
+    # 'data' is the raw chunk-ext text captured from a chunk header, e.g.
+    # b';foo=bar; baz="quux"'. The chunk_header regex is lenient about
+    # trailing whitespace, so tolerate it here too.
+    data = data.rstrip(b" \t")
+    extensions: List[Tuple[bytes, bytes]] = []
+    pos = 0
+    while pos < len(data):
+        match = chunk_ext_part_re.match(data, pos)
+        if match is None:
+            raise LocalProtocolError(f"illegal chunk extension: {data[pos:]!r}")
+        pos = match.end()
+        value = match["ext_val"]
+        if value is None:
+            value = b""
+        elif value[:1] == b'"':
+            value = _unquote_chunk_ext_value(value[1:-1])
+        extensions.append((match["ext_name"], value))
+    return extensions
+
 
 class ChunkedReader:
-    def __init__(self) -> None:
+    def __init__(self, preserve_chunk_extensions: bool = False) -> None:
+        self._preserve_chunk_extensions = preserve_chunk_extensions
         self._bytes_in_chunk = 0
         # After reading a chunk, we have to throw away the trailing \r\n.
         # This tracks the bytes that we need to match and throw away.
         self._bytes_to_discard = b""
         self._reading_trailer = False
+        # The extensions attached to the chunk currently being read.
+        self._chunk_extensions: Tuple[Tuple[bytes, bytes], ...] = ()
+        # True when we've parsed a chunk header but haven't yet emitted any
+        # of its data, so the next Data event starts a new chunk -- even if
+        # the chunk header and its data arrived in separate packets.
+        self._chunk_start_pending = False
 
     def __call__(self, buf: ReceiveBuffer) -> Union[Data, EndOfMessage, None]:
         if self._reading_trailer:
             lines = buf.maybe_extract_lines()
             if lines is None:
                 return None
-            return EndOfMessage(headers=list(_decode_header_lines(lines)))
+            return EndOfMessage(
+                headers=list(_decode_header_lines(lines)),
+                chunk_extensions=self._chunk_extensions,
+            )
         if self._bytes_to_discard:
             data = buf.maybe_extract_at_most(len(self._bytes_to_discard))
             if data is None:
@@ -183,25 +246,38 @@ class ChunkedReader:
                 "illegal chunk header: {!r}",
                 chunk_header,
             )
-            # XX FIXME: we discard chunk extensions. Does anyone care?
+            if self._preserve_chunk_extensions:
+                self._chunk_extensions = tuple(
+                    _parse_chunk_extensions(matches["chunk_ext"] or b"")
+                )
+            else:
+                # XX FIXME: we discard chunk extensions. Does anyone care?
+                self._chunk_extensions = ()
             self._bytes_in_chunk = int(matches["chunk_size"], base=16)
             if self._bytes_in_chunk == 0:
                 self._reading_trailer = True
                 return self(buf)
-            chunk_start = True
-        else:
-            chunk_start = False
+            self._chunk_start_pending = True
         assert self._bytes_in_chunk > 0
         data = buf.maybe_extract_at_most(self._bytes_in_chunk)
         if data is None:
             return None
+        chunk_start = self._chunk_start_pending
+        self._chunk_start_pending = False
         self._bytes_in_chunk -= len(data)
         if self._bytes_in_chunk == 0:
             self._bytes_to_discard = b"\r\n"
             chunk_end = True
         else:
             chunk_end = False
-        return Data(data=data, chunk_start=chunk_start, chunk_end=chunk_end)
+        return Data(
+            data=data,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            # Extensions belong to the chunk as a whole, so we only report
+            # them on the first Data event of each chunk.
+            chunk_extensions=self._chunk_extensions if chunk_start else (),
+        )
 
     def read_eof(self) -> NoReturn:
         raise RemoteProtocolError(

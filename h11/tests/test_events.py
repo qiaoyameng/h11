@@ -132,6 +132,22 @@ def test_intenum_status_code() -> None:
     assert type(r.status_code) is int
 
 
+def test_chunk_extensions_normalization() -> None:
+    # chunk_extensions default to empty, and are normalized to bytes
+    d = Data(data=b"x")
+    assert d.chunk_extensions == ()
+    d = Data(data=b"x", chunk_extensions=[("sig", "abc"), ("sig", "def"), ("f", "")])
+    assert d.chunk_extensions == ((b"sig", b"abc"), (b"sig", b"def"), (b"f", b""))
+    for name, value in d.chunk_extensions:
+        assert type(name) is bytes
+        assert type(value) is bytes
+
+    eom = EndOfMessage()
+    assert eom.chunk_extensions == ()
+    eom = EndOfMessage(chunk_extensions=[("final", "x")])
+    assert eom.chunk_extensions == ((b"final", b"x"),)
+
+
 def test_header_casing() -> None:
     r = Request(
         method="GET",

@@ -162,14 +162,25 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        preserve_chunk_extensions (bool):
+            If True, then chunk extensions on a chunked transfer-encoded
+            body are parsed and exposed as :attr:`Data.chunk_extensions`
+            (and :attr:`EndOfMessage.chunk_extensions` for the final
+            zero-length chunk), and any ``chunk_extensions`` set on outgoing
+            :class:`Data`/:class:`EndOfMessage` events are encoded into the
+            outgoing stream. If False (the default), then chunk extensions
+            are discarded when receiving and may not be sent.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        preserve_chunk_extensions: bool = False,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._preserve_chunk_extensions = preserve_chunk_extensions
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -331,6 +342,11 @@ class Connection:
             framing_type, args = _body_framing(
                 cast(bytes, self._request_method), cast(Union[Request, Response], event)
             )
+            if framing_type == "chunked":
+                return io_dict[SEND_BODY][framing_type](  # type: ignore[index]
+                    *args,
+                    preserve_chunk_extensions=self._preserve_chunk_extensions,
+                )
             return io_dict[SEND_BODY][framing_type](*args)  # type: ignore[index]
         else:
             # General case: the io_dict just has the appropriate reader/writer

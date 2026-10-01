@@ -1096,3 +1096,39 @@ Again, it is *strongly encouraged* that you avoid relying on this information
 if at all possible. This functionality should be considered an escape hatch for
 when there is no alternative but to rely on the information, rather than a
 general source of data that is worth relying on.
+
+.. _chunk-extensions:
+
+Chunk Extensions
+----------------
+
+HTTP/1.1 allows each chunk in a chunked transfer encoded body to carry
+"chunk extensions" -- ``;name=value`` metadata attached to the chunk header.
+Some protocols (ab)use these to attach per-chunk metadata such as signatures.
+
+By default, h11 parses chunk extensions and then discards them, as permitted
+by RFC 7230. If you need to see them -- for example, to verify a per-chunk
+signature, or to relay them to another server -- create your connection with
+``preserve_chunk_extensions=True``::
+
+   conn = h11.Connection(h11.SERVER, preserve_chunk_extensions=True)
+
+In this mode, the extensions of each chunk are made available as
+:data:`Data.chunk_extensions` on the :class:`Data` event where
+:data:`Data.chunk_start` is true, so even when a chunk is split across
+multiple :class:`Data` events you can tell which chunk the extensions belong
+to. Extensions on the final zero-length chunk -- which carries no data --
+are exposed as :data:`EndOfMessage.chunk_extensions` instead.
+
+Extensions are represented as a tuple of ``(name, value)`` pairs of byte
+strings, in the order they appeared; repeated names are preserved, and an
+extension without a value is represented by the empty byte string ``b""``.
+Quoted-string values are unquoted and unescaped for you.
+
+When sending on such a connection, you can set ``chunk_extensions`` on
+:class:`Data` and :class:`EndOfMessage` events, and h11 will encode them
+into the outgoing chunk headers, quoting and escaping values as required by
+the HTTP grammar. Values containing CR or LF (or other characters that are
+illegal in chunk extensions) are rejected with :exc:`LocalProtocolError`, as
+are attempts to send extensions on a connection that wasn't created with
+``preserve_chunk_extensions=True``.

@@ -238,6 +238,80 @@ def test_chunk_boundaries() -> None:
     assert conn.next_event() == EndOfMessage()
 
 
+def test_chunk_extensions_end_to_end() -> None:
+    client = Connection(our_role=CLIENT, preserve_chunk_extensions=True)
+    server = Connection(our_role=SERVER, preserve_chunk_extensions=True)
+
+    server.receive_data(
+        client.send(
+            Request(
+                method="POST",
+                target="/",
+                headers=[("Host", "example.com"), ("Transfer-Encoding", "chunked")],
+            )
+        )
+    )
+    assert type(server.next_event()) is Request
+    assert server.next_event() is NEED_DATA
+
+    # The sender encodes extensions into the chunk header...
+    data = client.send(
+        Data(data=b"hello", chunk_extensions=[(b"sig", b"abc"), (b"flag", b"")])
+    )
+    assert data == b"5;sig=abc;flag\r\nhello\r\n"
+    # ...and the receiver parses them back out, even when the bytes dribble
+    # in one at a time and the chunk is split across multiple Data events.
+    events = []
+    for i in range(len(data)):
+        server.receive_data(data[i : i + 1])
+        while True:
+            event = server.next_event()
+            if event is NEED_DATA:
+                break
+            events.append(event)
+    data_events = [event for event in events if type(event) is Data]
+    assert b"".join(event.data for event in data_events) == b"hello"
+    assert data_events[0].chunk_start
+    assert data_events[0].chunk_extensions == ((b"sig", b"abc"), (b"flag", b""))
+    assert all(event.chunk_extensions == () for event in data_events[1:])
+
+    # Extensions on the final zero-length chunk survive the round trip too.
+    eom = client.send(EndOfMessage(chunk_extensions=[(b"final", b"end sig")]))
+    assert eom == b'0;final="end sig"\r\n\r\n'
+    server.receive_data(eom)
+    assert server.next_event() == EndOfMessage(
+        chunk_extensions=[(b"final", b"end sig")]
+    )
+
+
+def test_chunk_extensions_disabled_by_default() -> None:
+    # Receiving: extensions are discarded, like they always have been
+    server = Connection(our_role=SERVER)
+    server.receive_data(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5;sig=abc\r\nhello\r\n"
+        b"0;final=x\r\n\r\n"
+    )
+    assert type(server.next_event()) is Request
+    assert server.next_event() == Data(data=b"hello", chunk_start=True, chunk_end=True)
+    assert server.next_event() == EndOfMessage()
+
+    # Sending: extensions are refused
+    client = Connection(our_role=CLIENT)
+    client.send(
+        Request(
+            method="POST",
+            target="/",
+            headers=[("Host", "example.com"), ("Transfer-Encoding", "chunked")],
+        )
+    )
+    with pytest.raises(LocalProtocolError):
+        client.send(Data(data=b"hello", chunk_extensions=[(b"sig", b"abc")]))
+
+
 def test_client_talking_to_http10_server() -> None:
     c = Connection(CLIENT)
     c.send(Request(method="GET", target="/", headers=[("Host", "example.com")]))
