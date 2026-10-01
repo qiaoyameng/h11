@@ -1,0 +1,8 @@
+Added an optional ``strict_request_target`` argument to
+:class:`Connection`. When enabled, h11 enforces the request-target
+grammar from RFC 7230 section 5.3 for both sent and received requests:
+the target must be origin-form (``/path?query``), absolute-form (an
+absolute URI), authority-form (``host:port`` for ``CONNECT``), or
+asterisk-form (``*`` for ``OPTIONS``), and the method and ``Host``
+header must match the form used. The target bytes are never modified;
+the default remains the previous permissive behavior.

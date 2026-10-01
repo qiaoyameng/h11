@@ -445,6 +445,40 @@ The Connection object
 
    .. autoattribute:: trailing_data
 
+.. _strict-request-target:
+
+Strict request-target validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, h11 is permissive about the :attr:`Request.target` field:
+it only requires that it be a non-empty string of visible ASCII
+characters, and otherwise passes the raw bytes straight through to
+your application. This is convenient, but for a proxy it is often
+useful to know that a target actually has one of the four forms
+defined by `RFC 7230 section 5.3
+<https://tools.ietf.org/html/rfc7230#section-5.3>`_: origin-form
+(``/some/path?query``), absolute-form (an absolute URI like
+``http://example.com/``), authority-form (``host:port``, used only by
+``CONNECT``), or asterisk-form (``*``, used only by ``OPTIONS``).
+
+Pass ``strict_request_target=True`` when constructing a
+:class:`Connection` to opt in to strict checking::
+
+   conn = h11.Connection(our_role=h11.SERVER, strict_request_target=True)
+
+The same rules are then applied to requests on both sides: a client
+calling :meth:`Connection.send` gets a :exc:`LocalProtocolError` for a
+malformed target, and a server's :meth:`Connection.next_event` raises
+:exc:`RemoteProtocolError` when the peer sends one. In addition to the
+form matching the method, the ``Host`` header must be syntactically
+valid and -- for absolute-form and authority-form requests -- must
+identify the same host (case-insensitive, with equivalent IPv6, IPv4,
+trailing-dot, and port handling) as the authority in the target; a
+mismatch is rejected. The target bytes themselves are never modified.
+
+When the option is disabled (the default), h11 retains its historical
+permissive behavior for backwards compatibility.
+
 
 .. _error-handling:
 

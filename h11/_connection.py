@@ -37,6 +37,7 @@ from ._state import (
     SERVER,
     SWITCHED_PROTOCOL,
 )
+from ._target import validate_request_target
 from ._util import (  # Import the internal things we need
     LocalProtocolError,
     RemoteProtocolError,
@@ -162,14 +163,30 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        strict_request_target (bool):
+            Whether to strictly validate the request-target of
+            :class:`Request` events, both when sending (via :meth:`send`)
+            and when receiving (via :meth:`next_event`). When ``False``
+            (the default), any non-empty byte string of visible
+            characters is accepted, for backwards compatibility. When
+            ``True``, the request-target must match one of the four
+            forms defined by RFC 7230 section 5.3 -- origin-form
+            (``/path?query``), absolute-form (an absolute URI),
+            authority-form (``host:port``, for ``CONNECT``), or
+            asterisk-form (``*``, for ``OPTIONS``) -- and its method and
+            ``Host`` header must be consistent with the form used. The
+            request-target bytes are never modified.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        strict_request_target: bool = False,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._strict_request_target = strict_request_target
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -270,6 +287,12 @@ class Connection:
 
     # All events go through here
     def _process_event(self, role: Type[Sentinel], event: Event) -> None:
+        # Optional strict request-target validation. This runs for both
+        # roles, so clients constructing a Request and servers reading
+        # one off the wire are held to exactly the same rules.
+        if self._strict_request_target and type(event) is Request:
+            validate_request_target(event)
+
         # First, pass the event through the state machine to make sure it
         # succeeds.
         old_states = dict(self._cstate.states)
