@@ -473,6 +473,83 @@ def test_ChunkedReader() -> None:
     t_body_reader(ChunkedReader, b"3\r\nxxx_\n1a\r\n", [LocalProtocolError])
 
 
+def _read_body_events_byte_by_byte(thunk: Any, data: bytes) -> List[Event]:
+    reader = thunk()
+    buf = ReceiveBuffer()
+    events: List[Event] = []
+    for position in range(len(data)):
+        buf += data[position : position + 1]
+        while True:
+            event = reader(buf)
+            if event is None:
+                break
+            events.append(event)
+            if type(event) is EndOfMessage:
+                return events
+    return events
+
+
+def test_ChunkedReader_preserves_extensions_byte_by_byte() -> None:
+    extensions = [
+        (b"sig", b"token"),
+        (b"quoted", b'a"b;\\c'),
+        (b"blank", None),
+        (b"empty", b""),
+        (b"dup", b"a"),
+        (b"dup", b"b"),
+    ]
+    wire = (
+        rb'5;sig=token;quoted="a\"b;\\c";blank;empty="";dup=a;dup=b'
+        + b"\r\nhello\r\n"
+        + b"3\r\nbye\r\n"
+        + b"0;last=one\r\nSome: header\r\n\r\n"
+    )
+
+    events = _read_body_events_byte_by_byte(
+        lambda: ChunkedReader(preserve_chunk_extensions=True), wire
+    )
+
+    expected: List[Event] = []
+    for position, char in enumerate(b"hello"):
+        expected.append(
+            Data(
+                data=bytes([char]),
+                chunk_start=position == 0,
+                chunk_end=position == len(b"hello") - 1,
+                chunk_extensions=extensions,
+            )
+        )
+    for position, char in enumerate(b"bye"):
+        expected.append(
+            Data(
+                data=bytes([char]),
+                chunk_start=position == 0,
+                chunk_end=position == len(b"bye") - 1,
+            )
+        )
+    expected.append(
+        EndOfMessage(
+            headers=[("Some", "header")],
+            chunk_extensions=[(b"last", b"one")],
+        )
+    )
+    assert events == expected
+
+
+def test_ChunkedReader_rejects_escaped_newline_in_extension() -> None:
+    with pytest.raises(LocalProtocolError):
+        ChunkedReader(preserve_chunk_extensions=True)(
+            makebuf(b'0;x="\\\r\n"\r\n\r\n')
+        )
+
+
+def test_ChunkedReader_rejects_unterminated_extension_value() -> None:
+    with pytest.raises(LocalProtocolError):
+        ChunkedReader(preserve_chunk_extensions=True)(
+            makebuf(b'0;x="unterminated\r\n\r\n')
+        )
+
+
 def test_ContentLengthWriter() -> None:
     w = ContentLengthWriter(5)
     assert dowrite(w, Data(data=b"123")) == b"123"
@@ -513,6 +590,77 @@ def test_ChunkedWriter() -> None:
         dowrite(w, EndOfMessage(headers=[("Etag", "asdf"), ("a", "b")]))
         == b"0\r\nEtag: asdf\r\na: b\r\n\r\n"
     )
+
+
+def test_ChunkedWriter_preserves_extensions() -> None:
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    assert dowrite(w, Data(data=b"abc", chunk_extensions=[("sig", b"7")])) == (
+        b"3;sig=7\r\nabc\r\n"
+    )
+
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    assert dowrite(
+        w,
+        Data(
+            data=b"abc",
+            chunk_start=True,
+            chunk_end=True,
+            chunk_extensions=[
+                ("sig", "001"),
+                ("q", b'a"b;c'),
+                ("blank", None),
+                ("empty", b""),
+                ("sig", b"42"),
+            ],
+        ),
+    ) == b'3;sig=001;q="a\\"b;c";blank;empty="";sig=42\r\nabc\r\n'
+
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    assert dowrite(
+        w,
+        Data(
+            data=b"he",
+            chunk_start=True,
+            chunk_end=False,
+            chunk_extensions=[("sig", b"7")],
+        ),
+    ) == b""
+    assert dowrite(w, Data(data=b"llo", chunk_start=False, chunk_end=True)) == (
+        b"5;sig=7\r\nhello\r\n"
+    )
+
+    assert dowrite(w, EndOfMessage(chunk_extensions=[("last", b"1")])) == (
+        b"0;last=1\r\n\r\n"
+    )
+
+
+def test_ChunkedWriter_rejects_extensions_and_newlines_when_disabled() -> None:
+    with pytest.raises(LocalProtocolError):
+        dowrite(ChunkedWriter(), Data(data=b"abc", chunk_extensions=[("sig", b"1")]))
+    with pytest.raises(LocalProtocolError):
+        dowrite(ChunkedWriter(), EndOfMessage(chunk_extensions=[("sig", b"1")]))
+
+
+def test_ChunkedWriter_rejects_newline_injection() -> None:
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    with pytest.raises(LocalProtocolError):
+        dowrite(
+            w,
+            Data(
+                data=b"abc",
+                chunk_extensions=[(b"sig\r\nBad", b"1")],
+            ),
+        )
+
+    w = ChunkedWriter(preserve_chunk_extensions=True)
+    with pytest.raises(LocalProtocolError):
+        dowrite(
+            w,
+            Data(
+                data=b"abc",
+                chunk_extensions=[(b"sig", b"1\r\nBad: yes")],
+            ),
+        )
 
 
 def test_Http10Writer() -> None:

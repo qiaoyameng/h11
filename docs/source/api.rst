@@ -1096,3 +1096,13 @@ Again, it is *strongly encouraged* that you avoid relying on this information
 if at all possible. This functionality should be considered an escape hatch for
 when there is no alternative but to rely on the information, rather than a
 general source of data that is worth relying on.
+
+Chunk extensions are discarded by default. Pass
+``preserve_chunk_extensions=True`` to :class:`Connection` to retain them as
+an ordered list of ``(name, value)`` byte pairs on
+:data:`Data.chunk_extensions`. The same extension list appears on every
+:class:`Data` event from a chunk, including chunks split across multiple
+events. Extensions on the terminating zero-length chunk are available on
+:data:`EndOfMessage.chunk_extensions`. A value of ``None`` denotes a
+valueless token extension; an empty byte string denotes an empty quoted
+value. Duplicate names retain their wire order.

@@ -238,6 +238,61 @@ def test_chunk_boundaries() -> None:
     assert conn.next_event() == EndOfMessage()
 
 
+def test_chunk_extensions() -> None:
+    extensions = [("sig", "001"), ("flag", None), ("sig", "002")]
+    server = Connection(SERVER, preserve_chunk_extensions=True)
+    client = Connection(CLIENT, preserve_chunk_extensions=True)
+
+    server.receive_data(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    assert type(server.next_event()) is Request
+
+    server.receive_data(b'5;sig=001;flag;sig=002\r\n' + b"hel")
+    assert server.next_event() == Data(
+        data=b"hel",
+        chunk_start=True,
+        chunk_end=False,
+        chunk_extensions=extensions,
+    )
+
+    server.receive_data(b"lo\r\n")
+    assert server.next_event() == Data(
+        data=b"lo",
+        chunk_start=False,
+        chunk_end=True,
+        chunk_extensions=extensions,
+    )
+
+    client.send(
+        Request(
+            method="GET",
+            target="/",
+            headers=[
+                ("Host", "example.com"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+        )
+    )
+    assert client.send(
+        Data(
+            data=b"hel",
+            chunk_start=True,
+            chunk_end=False,
+            chunk_extensions=extensions,
+        )
+    ) == b""
+    assert client.send(Data(data=b"lo", chunk_start=False, chunk_end=True)) == (
+        b"5;sig=001;flag;sig=002\r\nhello\r\n"
+    )
+    assert client.send(EndOfMessage(chunk_extensions=[("last", "1")])) == (
+        b"0;last=1\r\n\r\n"
+    )
+
+
 def test_client_talking_to_http10_server() -> None:
     c = Connection(CLIENT)
     c.send(Request(method="GET", target="/", headers=[("Host", "example.com")]))

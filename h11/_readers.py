@@ -20,6 +20,7 @@ import re
 from typing import Any, Callable, Dict, Iterable, NoReturn, Optional, Tuple, Type, Union
 
 from ._abnf import chunk_header, header_field, request_line, status_line
+from ._chunkextensions import ChunkExtensions, parse_chunk_extensions
 from ._events import Data, EndOfMessage, InformationalResponse, Request, Response
 from ._receivebuffer import ReceiveBuffer
 from ._state import (
@@ -146,19 +147,30 @@ chunk_header_re = re.compile(chunk_header.encode("ascii"))
 
 
 class ChunkedReader:
-    def __init__(self) -> None:
+    def __init__(self, preserve_chunk_extensions: bool = False) -> None:
+        self._preserve_chunk_extensions = preserve_chunk_extensions
         self._bytes_in_chunk = 0
         # After reading a chunk, we have to throw away the trailing \r\n.
         # This tracks the bytes that we need to match and throw away.
         self._bytes_to_discard = b""
         self._reading_trailer = False
+        self._current_chunk_extensions: Optional[ChunkExtensions] = None
+        self._zero_chunk_extensions: Optional[ChunkExtensions] = None
+        self._chunk_start = False
+
+    def _read_trailer(self, buf: ReceiveBuffer) -> Optional[EndOfMessage]:
+        lines = buf.maybe_extract_lines()
+        if lines is None:
+            return None
+        return EndOfMessage(
+            headers=list(_decode_header_lines(lines)),
+            chunk_extensions=self._zero_chunk_extensions,
+            _parsed=True,
+        )
 
     def __call__(self, buf: ReceiveBuffer) -> Union[Data, EndOfMessage, None]:
         if self._reading_trailer:
-            lines = buf.maybe_extract_lines()
-            if lines is None:
-                return None
-            return EndOfMessage(headers=list(_decode_header_lines(lines)))
+            return self._read_trailer(buf)
         if self._bytes_to_discard:
             data = buf.maybe_extract_at_most(len(self._bytes_to_discard))
             if data is None:
@@ -172,6 +184,7 @@ class ChunkedReader:
                 return None
             # else, fall through and read some more
         assert self._bytes_to_discard == b""
+        chunk_start = False
         if self._bytes_in_chunk == 0:
             # We need to refill our chunk count
             chunk_header = buf.maybe_extract_next_line()
@@ -183,14 +196,21 @@ class ChunkedReader:
                 "illegal chunk header: {!r}",
                 chunk_header,
             )
-            # XX FIXME: we discard chunk extensions. Does anyone care?
             self._bytes_in_chunk = int(matches["chunk_size"], base=16)
+            chunk_extensions = None
+            if self._preserve_chunk_extensions:
+                raw_extensions = matches["chunk_ext"]
+                if raw_extensions is not None:
+                    chunk_extensions = parse_chunk_extensions(raw_extensions)
             if self._bytes_in_chunk == 0:
                 self._reading_trailer = True
-                return self(buf)
-            chunk_start = True
-        else:
-            chunk_start = False
+                self._zero_chunk_extensions = chunk_extensions
+                return self._read_trailer(buf)
+            self._current_chunk_extensions = chunk_extensions
+            if self._preserve_chunk_extensions:
+                self._chunk_start = True
+            else:
+                chunk_start = True
         assert self._bytes_in_chunk > 0
         data = buf.maybe_extract_at_most(self._bytes_in_chunk)
         if data is None:
@@ -199,9 +219,20 @@ class ChunkedReader:
         if self._bytes_in_chunk == 0:
             self._bytes_to_discard = b"\r\n"
             chunk_end = True
+            chunk_extensions = self._current_chunk_extensions
+            self._current_chunk_extensions = None
         else:
             chunk_end = False
-        return Data(data=data, chunk_start=chunk_start, chunk_end=chunk_end)
+            chunk_extensions = self._current_chunk_extensions
+        if self._preserve_chunk_extensions:
+            chunk_start = self._chunk_start
+            self._chunk_start = False
+        return Data(
+            data=data,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            chunk_extensions=chunk_extensions,
+        )
 
     def read_eof(self) -> NoReturn:
         raise RemoteProtocolError(
